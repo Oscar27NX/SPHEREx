@@ -1,32 +1,30 @@
 <!doctype html>
 <html lang="en">
+
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>SPHEREx Minimalist Spectral &amp; Multi-Epoch Explorer</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="https://aladin.cds.unistra.fr/AladinLite/api/v3/latest/aladin.css" />
   <link rel="stylesheet" href="style.css" />
-  <script src="https://d3js.org/d3.v7.min.js"></script>
+  <script src="vendor/d3.v7.min.js"></script>
 </head>
+
 <body>
   <div id="app">
     <header id="hud-top">
       <div class="hud-group">
-        <span class="brand-mark">SPHEREx</span>
+        <span class="brand-mark">Uju Gaja</span>
         <select id="release-select" class="hud-select" title="Active SPHEREx Data Release"></select>
-        <button id="btn-reload-releases" class="hud-btn" title="Reload releases.json">↻</button>
+        <button id="btn-reload-releases" class="hud-btn" title="Refresh live IRSA release discovery">↻</button>
       </div>
 
       <div class="hud-group hud-coords">
         <label class="coord-field">
-          <span>RA</span>
+          <span>Right Ascension</span>
           <input id="input-ra" type="text" spellcheck="false" />
         </label>
         <label class="coord-field">
-          <span>Dec</span>
+          <span>Declination</span>
           <input id="input-dec" type="text" spellcheck="false" />
         </label>
         <button id="btn-go-coords" class="hud-btn hud-btn-accent">Go</button>
@@ -37,18 +35,14 @@
       <div class="hud-group hud-telemetry">
         <span class="pill" id="stat-fov">FOV 300&Prime;</span>
         <span class="pill" id="stat-zoom">Zoom 1.0x</span>
-        <span class="pill" id="stat-window">Window 10.0y</span>
-        <span class="pill pill-latency" id="stat-latency">-- ms</span>
-        <span class="pill" id="stat-cache">CACHE</span>
-        <button id="btn-irsa-live" class="hud-btn" title="Query live IRSA TAP metadata">IRSA</button>
-        <button id="btn-copy-url" class="hud-btn" title="Copy embeddable coordinate URL">Share URL</button>
+        <button id="btn-copy-url" class="hud-btn pill" title="Copy embeddable coordinate URL">Share URL</button>
       </div>
     </header>
 
     <div id="epoch-strip">
       <div class="epoch-modes">
         <button class="mode-btn active" data-mode="blink">Blink</button>
-        <button class="mode-btn" data-mode="coadd">Sum (+)</button>
+        <button class="mode-btn" data-mode="coadd">Mean (+)</button>
         <button class="mode-btn" data-mode="diff">Diff (-)</button>
         <button id="btn-play-pause" class="mode-btn">Pause</button>
         <button id="btn-speed" class="mode-btn" title="Toggle blink speed">220 ms</button>
@@ -64,8 +58,9 @@
           <svg id="sky-overlay-svg" viewBox="0 0 64 64" preserveAspectRatio="none"></svg>
         </div>
         <div id="loop-reset-ring"></div>
+        <div id="data-status" role="status" aria-live="polite"></div>
         <div id="viewport-corner-info">
-          <span id="hover-readout">Click source to inspect 102-band SED · Shift+Click to recenter · Wheel to zoom</span>
+          <span id="hover-readout">Catalog markers at their reference epochs · Shift+Click to recenter · Wheel to zoom</span>
         </div>
         <div id="flag-tooltip" class="hidden"></div>
       </div>
@@ -74,7 +69,7 @@
         <div class="aladin-header">
           <span>CDS Aladin Lite · AllWISE / Gaia DR3</span>
           <select id="aladin-survey-select" class="hud-select">
-            <option value="P/AllWISE/color">AllWISE Color</option>
+            <option value="P/allWISE/color">AllWISE Color</option>
             <option value="P/2MASS/color">2MASS Color</option>
             <option value="P/DSS2/color">DSS2 Optical</option>
           </select>
@@ -87,8 +82,8 @@
     <section id="controls-bar">
       <div class="control-cluster" id="detector-buttons">
         <span class="cluster-label">Arrays</span>
-        <button class="chip active" data-det="all">6-Array SNR</button>
-        <button class="chip" data-det="fft2d">6-Array FFT</button>
+        <button class="chip active" data-det="all">Available arrays</button>
+        <button class="chip" data-det="fft2d">Spatial smoothing</button>
         <button class="chip" data-det="rgb">RGB (D1+D3+D5)</button>
         <button class="chip" data-det="D1">D1</button>
         <button class="chip" data-det="D2">D2</button>
@@ -99,17 +94,18 @@
       </div>
 
       <div class="control-cluster" id="fft-buttons">
-        <span class="cluster-label">102-Band FFT</span>
+        <span class="cluster-label">Spectral FFT</span>
         <button class="chip active" data-fft="raw">Raw</button>
-        <button class="chip" data-fft="low">Continuum (Low k)</button>
-        <button class="chip" data-fft="mid">Ice/CH4 (Mid k)</button>
-        <button class="chip" data-fft="high">Lines (High k)</button>
+        <button class="chip" data-fft="low">Low modes</button>
+        <button class="chip" data-fft="mid">Mid modes</button>
+        <button class="chip" data-fft="high">High modes</button>
       </div>
 
       <div class="control-cluster" id="fov-buttons">
         <span class="cluster-label">FOV</span>
         <button class="chip" data-fov="150">150&Prime;</button>
         <button class="chip active" data-fov="300">300&Prime;</button>
+        <label class="coord-field">Custom <input id="input-fov" type="number" min="60" max="1800" step="1" value="300" aria-label="Field of view in arcseconds" />&Prime;</label>
         <button class="chip" data-fov="600">600&Prime;</button>
         <button class="chip" data-fov="1200">1200&Prime;</button>
       </div>
@@ -127,15 +123,15 @@
     <section id="d3-drawer">
       <div class="d3-card d3-card-sed">
         <div class="d3-card-head">
-          <span id="sed-title">102-Band Infrared Spectrum (0.75 – 5.00 µm)</span>
-          <span id="sed-subtitle" class="mono-dim">6 detectors × 17 channels</span>
+          <span id="sed-title">Observed center brightness (MJy/sr)</span>
+          <span id="sed-subtitle" class="mono-dim">Measured wavelengths</span>
         </div>
         <svg id="sed-svg"></svg>
       </div>
 
       <div class="d3-card d3-card-fft">
         <div class="d3-card-head">
-          <span>Spectral FFT Power |F(k)|</span>
+          <span>FFT amplitude &middot; spectral period (&micro;m)</span>
           <span id="fft-subtitle" class="mono-dim">Frequency filter active: raw</span>
         </div>
         <svg id="fft-svg"></svg>
@@ -151,7 +147,7 @@
     </section>
   </div>
 
-  <script src="https://aladin.cds.unistra.fr/AladinLite/api/v3/latest/aladin.js" defer></script>
   <script type="module" src="app.js"></script>
 </body>
+
 </html>

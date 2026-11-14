@@ -119,11 +119,6 @@ body {
   color: var(--muted);
 }
 
-.pill-latency {
-  color: var(--good);
-  border-color: rgba(52, 211, 153, 0.35);
-}
-
 #epoch-strip {
   display: flex;
   align-items: center;
@@ -452,3 +447,7 @@ body.embed-mode #d3-drawer {
   font-family: var(--mono);
   font-size: 9px;
 }
+
+#data-status { position: absolute; top: 8px; left: 12px; right: 12px; z-index: 5; color: var(--muted); font-family: var(--mono); font-size: 11px; pointer-events: none; text-shadow: 0 1px 3px black; }
+.chip:disabled { opacity: .4; cursor: not-allowed; }
+#input-fov { width: 65px; }
