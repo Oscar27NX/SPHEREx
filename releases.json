@@ -1,0 +1,169 @@
+{
+  "default_release": "SPHEREx-DR1",
+  "default_time_window_years": 10.0,
+  "releases": [
+    {
+      "id": "SPHEREx-DR1",
+      "label": "DR1 All-Sky & Spectral Images",
+      "published": "2026-06-15",
+      "epoch_start_year": 2016.0,
+      "epoch_end_year": 2026.0,
+      "tap_url": "https://irsa.ipac.caltech.edu/TAP/sync",
+      "siav2_url": "https://irsa.ipac.caltech.edu/SIA?MISSION=spherex",
+      "ibe_prefix": "https://irsa.ipac.caltech.edu/ibe/data/spherex/",
+      "table_plane": "spherex.plane",
+      "table_artifact": "spherex.artifact",
+      "notes": "calibrated level 2 spectral images plus baseline wise/neowise epoch anchor"
+    },
+    {
+      "id": "SPHEREx-QR2",
+      "label": "QR2 Quick Release",
+      "published": "2025-11-20",
+      "epoch_start_year": 2016.0,
+      "epoch_end_year": 2025.9,
+      "tap_url": "https://irsa.ipac.caltech.edu/TAP/sync",
+      "siav2_url": "https://irsa.ipac.caltech.edu/SIA?MISSION=spherex",
+      "ibe_prefix": "https://irsa.ipac.caltech.edu/ibe/data/spherex/qr2/",
+      "table_plane": "spherex.plane",
+      "table_artifact": "spherex.artifact",
+      "notes": "early survey pass quick release frames"
+    },
+    {
+      "id": "SPHEREx-QR1",
+      "label": "QR1 Commissioning & Initial",
+      "published": "2025-07-01",
+      "epoch_start_year": 2016.0,
+      "epoch_end_year": 2025.5,
+      "tap_url": "https://irsa.ipac.caltech.edu/TAP/sync",
+      "siav2_url": "https://irsa.ipac.caltech.edu/SIA?MISSION=spherex",
+      "ibe_prefix": "https://irsa.ipac.caltech.edu/ibe/data/spherex/qr1/",
+      "table_plane": "spherex.plane",
+      "table_artifact": "spherex.artifact",
+      "notes": "initial release subset"
+    }
+  ],
+  "detectors": [
+    {
+      "id": "D1",
+      "name": "Array 1 (SW1)",
+      "bandpass_name": "SPHEREx-D1",
+      "lambda_min_um": 0.75,
+      "lambda_max_um": 1.11,
+      "channels": 17,
+      "resolution_r": 41,
+      "pixel_scale_arcsec": 6.2,
+      "color": "#60a5fa"
+    },
+    {
+      "id": "D2",
+      "name": "Array 2 (SW2)",
+      "bandpass_name": "SPHEREx-D2",
+      "lambda_min_um": 1.11,
+      "lambda_max_um": 1.64,
+      "channels": 17,
+      "resolution_r": 41,
+      "pixel_scale_arcsec": 6.2,
+      "color": "#34d399"
+    },
+    {
+      "id": "D3",
+      "name": "Array 3 (SW3)",
+      "bandpass_name": "SPHEREx-D3",
+      "lambda_min_um": 1.64,
+      "lambda_max_um": 2.42,
+      "channels": 17,
+      "resolution_r": 41,
+      "pixel_scale_arcsec": 6.2,
+      "color": "#a78bfa"
+    },
+    {
+      "id": "D4",
+      "name": "Array 4 (LW1)",
+      "bandpass_name": "SPHEREx-D4",
+      "lambda_min_um": 2.42,
+      "lambda_max_um": 3.82,
+      "channels": 17,
+      "resolution_r": 35,
+      "pixel_scale_arcsec": 6.2,
+      "color": "#f59e0b"
+    },
+    {
+      "id": "D5",
+      "name": "Array 5 (LW2)",
+      "bandpass_name": "SPHEREx-D5",
+      "lambda_min_um": 3.82,
+      "lambda_max_um": 4.42,
+      "channels": 17,
+      "resolution_r": 110,
+      "pixel_scale_arcsec": 6.2,
+      "color": "#f97316"
+    },
+    {
+      "id": "D6",
+      "name": "Array 6 (LW3)",
+      "bandpass_name": "SPHEREx-D6",
+      "lambda_min_um": 4.42,
+      "lambda_max_um": 5.00,
+      "channels": 17,
+      "resolution_r": 130,
+      "pixel_scale_arcsec": 6.2,
+      "color": "#ef4444"
+    }
+  ],
+  "flags_bitmask": [
+    { "bit": 0, "name": "TRANSIENT", "label": "Cosmic Ray / Transient", "color": "#f43f5e", "severity": "warn" },
+    { "bit": 1, "name": "OVERFLOW", "label": "Saturation Overflow", "color": "#ef4444", "severity": "high" },
+    { "bit": 2, "name": "SUR_ERROR", "label": "Ramp Fit Error", "color": "#fb923c", "severity": "warn" },
+    { "bit": 6, "name": "NONFUNC", "label": "Dead Pixel", "color": "#94a3b8", "severity": "high" },
+    { "bit": 7, "name": "DICHROIC", "label": "Dichroic Mask", "color": "#a855f7", "severity": "info" },
+    { "bit": 9, "name": "MISSING_DATA", "label": "Missing Data", "color": "#64748b", "severity": "high" },
+    { "bit": 10, "name": "HOT", "label": "Hot Pixel", "color": "#f97316", "severity": "warn" },
+    { "bit": 11, "name": "COLD", "label": "Cold Pixel", "color": "#38bdf8", "severity": "warn" },
+    { "bit": 15, "name": "NONLINEAR", "label": "Non-linear Response", "color": "#eab308", "severity": "warn" },
+    { "bit": 17, "name": "PERSIST", "label": "Charge Persistence", "color": "#ec4899", "severity": "warn" },
+    { "bit": 19, "name": "OUTLIER", "label": "Sigma-Clipped Outlier", "color": "#f43f5e", "severity": "info" },
+    { "bit": 20, "name": "CROSSTALK", "label": "Electronic Crosstalk", "color": "#c084fc", "severity": "warn" },
+    { "bit": 21, "name": "SOURCE", "label": "Known Source Footprint", "color": "#22c55e", "severity": "info" },
+    { "bit": 22, "name": "GHOST", "label": "Scattered Light Ghost", "color": "#fbbf24", "severity": "high" },
+    { "bit": 24, "name": "STREAK", "label": "Satellite / Asteroid Streak", "color": "#38bdf8", "severity": "high" },
+    { "bit": 27, "name": "SNOWBALL", "label": "Cosmic Ray Snowball", "color": "#f87171", "severity": "high" },
+    { "bit": 28, "name": "HALO", "label": "Bright Star Halo", "color": "#fde047", "severity": "info" }
+  ],
+  "preset_targets": [
+    {
+      "name": "WISE J0855-0714 (Y-Dwarf High PM)",
+      "ra": 133.7867,
+      "dec": -7.2442,
+      "fov": 300,
+      "notes": "coldest known brown dwarf with ~8.1 arcsec/yr proper motion and deep 3-5 um absorption"
+    },
+    {
+      "name": "Barnard's Star (10.3\"/yr PM)",
+      "ra": 269.4521,
+      "dec": 4.6934,
+      "fov": 300,
+      "notes": "fastest apparent stellar motion across sky over 10-year window"
+    },
+    {
+      "name": "Luhman 16AB Binary",
+      "ra": 162.3289,
+      "dec": -53.3195,
+      "fov": 300,
+      "notes": "nearby L/T transition brown dwarf pair with 2.78 arcsec/yr motion"
+    },
+    {
+      "name": "SPHEREx North Ecliptic Pole Deep Field",
+      "ra": 270.0,
+      "dec": 66.5607,
+      "fov": 600,
+      "notes": "high-cadence deep field with dense galaxy SEDs and PAH/ice features"
+    },
+    {
+      "name": "Taurus Molecular Cloud Ice Core",
+      "ra": 69.85,
+      "dec": 25.62,
+      "fov": 450,
+      "notes": "strong H2O (3.05 um), CO2 (4.27 um), and CO (4.67 um) interstellar ice absorption"
+    }
+  ]
+}
