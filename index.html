@@ -59,8 +59,11 @@
         </div>
         <div id="loop-reset-ring"></div>
         <div id="data-status" role="status" aria-live="polite"></div>
+        <div id="retrieval-progress" class="hidden" role="status"><progress id="retrieval-bar" aria-label="Archive retrieval"></progress><span id="retrieval-label"></span></div>
+        <div id="overlay-status"></div>
+        <div id="empty-view" class="hidden" role="status"></div>
         <div id="viewport-corner-info">
-          <span id="hover-readout">Catalog markers at their reference epochs · Shift+Click to recenter · Wheel to zoom</span>
+          <span id="hover-readout">Click a marker for catalog identity · Shift+Click to recenter · Wheel to zoom</span>
         </div>
         <div id="flag-tooltip" class="hidden"></div>
       </div>
@@ -84,7 +87,7 @@
         <span class="cluster-label">Arrays</span>
         <button class="chip active" data-det="all">Available arrays</button>
         <button class="chip" data-det="fft2d">Spatial smoothing</button>
-        <button class="chip" data-det="rgb">RGB (D1+D3+D5)</button>
+        <button class="chip" data-det="rgb" title="False color: D5 red, D3 green, D1 blue. Blink uses the nearest observation per detector inside the time brush; channel dates can differ.">RGB (D1+D3+D5)</button>
         <button class="chip" data-det="D1">D1</button>
         <button class="chip" data-det="D2">D2</button>
         <button class="chip" data-det="D3">D3</button>
@@ -99,6 +102,7 @@
         <button class="chip" data-fft="low">Low modes</button>
         <button class="chip" data-fft="mid">Mid modes</button>
         <button class="chip" data-fft="high">High modes</button>
+        <button class="chip" id="btn-fft-demo" aria-pressed="false" title="Demonstrate Fourier filters with a labeled synthetic signal, not sky measurements">FFT demo</button>
       </div>
 
       <div class="control-cluster" id="fov-buttons">

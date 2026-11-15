@@ -11,12 +11,22 @@ from unittest.mock import patch
 import numpy as np
 from astropy.io import fits
 from astropy.wcs import WCS
+from astropy.time import Time
 
-from archive import Archive, ArchiveError, DiskCache, compute_spectral_fft, covers_center, display_wcs, empty_sky, read_votable
-from server import SkyEngine, load_config, normalize_query
+from archive import Archive, ArchiveError, DiskCache, compute_spectral_fft, covers_center, display_wcs, empty_sky, encoded, read_votable
+from server import SkyEngine, cached_preview, load_config, normalize_query
 
 
 class SpectrumTests(unittest.TestCase):
+    def test_demo_filters_have_disjoint_known_components(self):
+        i = np.arange(48)
+        low = 3 + np.cos(2*np.pi*3*i/48)
+        mid = .5*np.cos(2*np.pi*12*i/48)
+        high = .25*np.cos(2*np.pi*20*i/48)
+        result = compute_spectral_fft(low+mid+high, .9+i*.08)
+        for name, expected in [("low", low), ("mid", mid), ("high", high)]:
+            np.testing.assert_allclose(result["fft_bands"][name], expected, atol=1e-12)
+
     def test_known_spectral_period_and_dc(self):
         wavelength = .75 + np.arange(100) * .02
         spectrum = 3 + np.sin(2 * np.pi * np.arange(100) / 10)
@@ -36,6 +46,16 @@ class SpectrumTests(unittest.TestCase):
 
 
 class ArchiveTests(unittest.TestCase):
+    def test_empty_sia_finishes_without_catalog_downloads(self):
+        archive = Archive(self.cache)
+        progress = []
+        with patch.object(archive, "search", return_value=([], ["spherex_dr1"])), \
+             patch.object(archive, "catalogs", side_effect=AssertionError("unnecessary catalog request")):
+            sky = archive.build_sky(load_config(), 1, 2, 300, 10, "auto", progress=lambda **p: progress.append(p))
+        self.assertEqual(sky["data_status"], "empty")
+        self.assertIn("No data found", sky["message"])
+        self.assertEqual(progress[0]["phase"], "discovery")
+
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
@@ -53,6 +73,16 @@ class ArchiveTests(unittest.TestCase):
     def test_votable_error_is_not_empty_coverage(self):
         with self.assertRaisesRegex(ArchiveError, "service failed"):
             read_votable(b'<VOTABLE><RESOURCE><INFO name="QUERY_STATUS" value="ERROR">service failed</INFO></RESOURCE></VOTABLE>')
+
+    def test_search_reuses_discovery_when_only_fov_changes(self):
+        calls = []
+        archive = Archive(self.cache, lambda url, params: calls.append(params) or b"unused")
+        self.cache.put("collections", ["spherex_dr1"])
+        with patch("archive.read_votable", return_value=([{"obs_id": "test"}], False)):
+            small, _ = archive.search(1, 2, 150, 10, "auto")
+            large, _ = archive.search(1, 2, 600, 10, "auto")
+        self.assertEqual(small, large)
+        self.assertEqual(len(calls), 1)
 
     def test_footprint_selection_handles_ra_wrap(self):
         row = {"s_region": "POLYGON ICRS 359 -1 1 -1 1 1 359 1"}
@@ -115,19 +145,93 @@ class ArchiveTests(unittest.TestCase):
         self.assertTrue(np.isnan(plane[53, 53]))
         self.assertEqual(result["center_brightness"], 2)
         self.assertEqual(result["detector"], 1)
-        self.assertAlmostEqual(float(requests[0]["size"]), 300 * np.sqrt(2) / 3600)
+        self.assertAlmostEqual(float(requests[0]["size"]), 600 * np.sqrt(2) / 3600)
         archive.cutout(row, 20, 30, 300)
         self.assertEqual(len(requests), 1)
+        smaller = archive.cutout(row, 20, 30, 150)
+        self.assertEqual(len(requests), 1)
+        smaller_plane = np.frombuffer(base64.b64decode(smaller["frame"]), dtype="<f4").reshape(64, 64)
+        self.assertFalse(np.array_equal(plane, smaller_plane, equal_nan=True))
+        self.assertEqual(smaller_plane[43, 33], 2)
 
 
 class EngineTests(unittest.TestCase):
+    def test_pending_request_reports_real_progress(self):
+        reported, finish = threading.Event(), threading.Event()
+        class ReportingArchive:
+            def build_sky(self, config, *query, progress):
+                progress(phase="cutouts", completed=1, total=3)
+                reported.set()
+                finish.wait(3)
+                return dict(empty_sky(config, *query), data_status="empty")
+        with tempfile.TemporaryDirectory() as directory:
+            engine = SkyEngine(directory, ReportingArchive())
+            try:
+                engine.get_sky_cube(1, 2)
+                self.assertTrue(reported.wait(2))
+                result = engine.get_sky_cube(1, 2)
+                self.assertEqual(result["progress"]["phase"], "cutouts")
+                self.assertEqual(result["progress"]["completed"], 1)
+                self.assertEqual(result["progress"]["total"], 3)
+                self.assertTrue(result["refreshing"])
+            finally:
+                finish.set()
+                engine.pool.shutdown()
+
+    def test_preview_reprojects_and_masks_without_mutating_cached_observations(self):
+        config = load_config()
+        source = empty_sky(config, 1, 2, 300, 10, "auto")
+        now = Time.now().mjd
+        source.update(grid_size=4, data_status="ready", epochs=[
+            {"mjd": now-2, "source": "spherex_dr1", "detectors": [1]},
+            {"mjd": now-1, "source": "spherex_dr2", "detectors": [3]}],
+            measurements=[{"mjd": now-1, "detector": 2, "brightness": 5, "wavelength_um": 2}],
+            sources=[{"px": 3, "py": 1}])
+        frames = np.full((2, 6, 4, 4), np.nan)
+        frames[0, 0] = 2
+        frames[1, 2] = 5
+        source.update(frames_b64=encoded(frames), flags_b64=encoded(np.zeros((2,4,4)), "<u4"),
+                      wavelength_maps_b64=encoded(np.ones((2,4,4))), bandwidth_maps_b64=encoded(np.ones((2,4,4))))
+        original = json.dumps(source)
+        result = cached_preview([(time.time(), source)], config, (1, 2, 600, 10, "spherex_dr2"))
+        self.assertTrue(result["preview"])
+        self.assertEqual(len(result["epochs"]), 1)
+        self.assertEqual(result["epochs"][0]["index"], 0)
+        self.assertEqual(result["measurements"], source["measurements"])
+        self.assertEqual(result["pixel_scale_arcsec"], 150)
+        plane = np.frombuffer(base64.b64decode(result["frames_b64"]), dtype="<f4").reshape(6,4,4)
+        self.assertTrue(np.isnan(plane[2, 0]).all())
+        self.assertEqual(plane[2, 1, 1], 5)
+        flags = np.frombuffer(base64.b64decode(result["flags_b64"]), dtype="<u4").reshape(4,4)
+        self.assertEqual(flags[0, 0], 1 << 9)
+        self.assertEqual(result["sources"][0], {"px": 2.5, "py": 1.5})
+        self.assertEqual(json.dumps(source), original)
+        self.assertIsNone(cached_preview([(0, source)], config, (2, 2, 600, 10, "auto")))
+        self.assertIsNone(cached_preview([(0, source)], config, (1, 2, 600, 10, "spherex_dr3")))
+
+    def test_upstream_error_is_safe_for_display(self):
+        class Unavailable:
+            def build_sky(self, *args, **kwargs):
+                raise RuntimeError("503 secret internal upstream URL")
+        with tempfile.TemporaryDirectory() as directory:
+            engine = SkyEngine(directory, Unavailable())
+            try:
+                with self.assertRaises(RuntimeError):
+                    engine.get_sky_cube(1, 2, wait=True)
+                result = engine.get_sky_cube(1, 2)
+                self.assertEqual(result["data_status"], "error")
+                self.assertNotIn("503", json.dumps(result))
+                self.assertNotIn("secret", json.dumps(result))
+            finally:
+                engine.pool.shutdown()
+
     def test_validation_and_independent_fov_keys(self):
         self.assertEqual(normalize_query(361, 90, 450)[0], 1)
         for query in [(float("nan"), 0), (0, 91), (0, 0, 0), (0, 0, 300, float("inf"))]:
             with self.assertRaises(ValueError):
                 normalize_query(*query)
         class FakeArchive:
-            def build_sky(self, config, *query):
+            def build_sky(self, config, *query, **kwargs):
                 return dict(empty_sky(config, *query), data_status="ready")
         with tempfile.TemporaryDirectory() as directory:
             engine = SkyEngine(directory, FakeArchive())
@@ -136,7 +240,8 @@ class EngineTests(unittest.TestCase):
                     self.assertEqual(engine.get_sky_cube(1, 2, fov, wait=True)["fov"], fov)
                 self.assertEqual(engine.get_sky_cube(1, 2, 450)["cache"], "HIT")
                 restarted = SkyEngine(directory, FakeArchive())
-                self.assertEqual(restarted.get_sky_cube(1, 2, 150)["cache"], "HIT")
+                with patch.object(restarted.cache, "get", side_effect=AssertionError("memory hit must not read disk")):
+                    self.assertEqual(restarted.get_sky_cube(1, 2, 150)["cache"], "HIT")
                 restarted.pool.shutdown()
             finally:
                 engine.pool.shutdown()
@@ -145,7 +250,7 @@ class EngineTests(unittest.TestCase):
         gate = threading.Event()
         class FakeArchive:
             count = 0
-            def build_sky(self, config, *query):
+            def build_sky(self, config, *query, **kwargs):
                 self.count += 1
                 gate.wait(2)
                 return dict(empty_sky(config, *query), data_status="ready")

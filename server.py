@@ -1,4 +1,5 @@
 import argparse
+import base64
 import gzip
 import hashlib
 import json
@@ -7,13 +8,17 @@ import os
 import re
 import threading
 import time
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from archive import Archive, CACHE_VERSION, DiskCache, empty_sky
+import numpy as np
+from astropy.time import Time
+
+from archive import Archive, CACHE_VERSION, DiskCache, empty_sky, encoded
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -38,6 +43,43 @@ def normalize_query(ra, dec, fov=300, window=10, release="auto"):
     return round(ra % 360, 6), round(dec, 6), round(fov, 3), round(window, 3), release
 
 
+def cached_preview(candidates, config, query):
+    ra, dec, fov, window, release = query
+    compatible = [item for item in candidates if item and item[1].get("epochs")
+                  and all(field in item[1] for field in ("frames_b64", "flags_b64", "wavelength_maps_b64", "bandwidth_maps_b64"))
+                  and abs(item[1]["ra"] - ra) < 1e-6 and abs(item[1]["dec"] - dec) < 1e-6
+                  and item[1]["window"] >= window]
+    compatible.sort(key=lambda item: (item[1]["fov"] < fov, abs(item[1]["fov"] - fov), -item[0]))
+    cutoff = Time.now().mjd - window * 365.25
+    for _, source in compatible:
+        indices = [i for i, ep in enumerate(source["epochs"]) if
+                   (release == "auto" or ep["source"] in (release, release + "_deep"))
+                   and ep["mjd"] >= cutoff]
+        if not indices:
+            continue
+        result = dict(source, fov=fov, window=window, release={"id": release}, preview=True,
+                      pixel_scale_arcsec=fov / source["grid_size"], measurements=[], message="Cached preview; refining requested field. Uncovered pixels are blank.")
+        grid = source["grid_size"]
+        positions = np.floor((np.arange(grid) + .5 - grid / 2) * fov / source["fov"] + grid / 2).astype(int)
+        valid = (positions >= 0) & (positions < grid)
+        clipped = np.clip(positions, 0, grid - 1)
+        mask = valid[:, None] & valid[None, :]
+        for field, dtype, extra in [("frames_b64", "<f4", (6,)), ("flags_b64", "<u4", ()),
+                                     ("wavelength_maps_b64", "<f4", ()), ("bandwidth_maps_b64", "<f4", ())]:
+            data = np.frombuffer(base64.b64decode(source[field]), dtype=dtype).reshape((len(source["epochs"]), *extra, grid, grid))[indices]
+            data = data[..., clipped[:, None], clipped[None, :]].copy()
+            data[..., ~mask] = (1 << 9) if dtype == "<u4" else np.nan
+            result[field] = encoded(data, dtype)
+        result["epochs"] = [dict(source["epochs"][i], index=j) for j, i in enumerate(indices)]
+        included = {(ep["mjd"], d - 1) for ep in result["epochs"] for d in ep["detectors"]}
+        result["measurements"] = [m for m in source.get("measurements", []) if (m["mjd"], m["detector"]) in included]
+        result["sources"] = [dict(s, px=(s["px"]-grid/2)*source["fov"]/fov+grid/2,
+                                   py=(s["py"]-grid/2)*source["fov"]/fov+grid/2) for s in source["sources"]]
+        result["sources"] = [s for s in result["sources"] if 0 <= s["px"] < grid and 0 <= s["py"] < grid]
+        return result
+    return None
+
+
 class SkyEngine:
     def __init__(self, directory=None, archive=None):
         self.config = load_config()
@@ -45,8 +87,14 @@ class SkyEngine:
         self.archive = archive or Archive(self.cache)
         self.pool = ThreadPoolExecutor(max_workers=2)
         self.lock = threading.Lock()
+        self.memory = OrderedDict()
+        with self.cache.connect() as db:
+            keys = [r[0] for r in db.execute("SELECT key FROM cache WHERE key LIKE 'sky:%' ORDER BY created DESC LIMIT 24")]
+        for key in reversed(keys):
+            self.memory[key] = self.cache.get(key)
         self.pending = {}
         self.errors = {}
+        self.progress = {}
         self.ttl = float(os.environ.get("SPHEREX_CACHE_TTL", "3600"))
 
     def configuration(self):
@@ -59,22 +107,42 @@ class SkyEngine:
         return config
 
     def _refresh(self, key, query):
+        def progress(**values):
+            with self.lock:
+                self.progress[key].update(values)
         try:
-            payload = self.archive.build_sky(self.config, *query)
+            payload = self.archive.build_sky(self.config, *query, progress=progress)
             self.cache.put(key, payload)
             with self.lock:
                 self.errors.pop(key, None)
+                self.memory[key] = (time.time(), payload)
+                self.memory.move_to_end(key)
+                while len(self.memory) > 24:
+                    self.memory.popitem(last=False)
             return payload
         except Exception as exc:
             with self.lock:
                 self.errors[key] = (time.time(), str(exc))
             raise
+        finally:
+            with self.lock:
+                self.progress.pop(key, None)
 
     def get_sky_cube(self, ra, dec, fov_arcsec=300, window_years=10, release_id="auto", wait=False, force=False):
         started = time.perf_counter()
         query = normalize_query(ra, dec, fov_arcsec, window_years, release_id or "auto")
         key = "sky:" + hashlib.sha256(json.dumps([CACHE_VERSION, *query]).encode()).hexdigest()
-        cached = self.cache.get(key)
+        with self.lock:
+            cached = self.memory.get(key)
+            if cached:
+                self.memory.move_to_end(key)
+        if cached is None:
+            cached = self.cache.get(key)
+            if cached:
+                with self.lock:
+                    self.memory[key] = cached
+                    while len(self.memory) > 24:
+                        self.memory.popitem(last=False)
         stale = cached is None or time.time() - cached[0] >= self.ttl or force
         with self.lock:
             future = self.pending.get(key)
@@ -83,6 +151,7 @@ class SkyEngine:
                 future = None
             error = self.errors.get(key)
             if stale and future is None and (force or error is None or time.time() - error[0] >= 60):
+                self.progress[key] = {"phase": "queued", "completed": 0, "total": 0, "started_at": time.time()}
                 future = self.pool.submit(self._refresh, key, query)
                 self.pending[key] = future
         if wait and future:
@@ -92,13 +161,21 @@ class SkyEngine:
             result = dict(cached[1])
             result["cache"] = "STALE" if stale else "HIT"
         else:
-            result = empty_sky(self.config, *query)
+            with self.lock:
+                candidates = list(self.memory.values())
+            result = cached_preview(candidates, self.config, query) or empty_sky(self.config, *query)
             result["cache"] = "MISS"
             if error:
-                result.update(data_status="error", message=error[1])
+                if result["data_status"] != "ready":
+                    result.update(data_status="error", message="The archive is temporarily unavailable. Retrying shortly; try another target or release.")
         result["refreshing"] = bool(future and not future.done())
+        with self.lock:
+            progress = self.progress.get(key)
+            if progress:
+                result["progress"] = {k: v for k, v in progress.items() if k != "started_at"}
+                result["progress"]["elapsed_seconds"] = round(time.time() - progress["started_at"])
         if error:
-            result["refresh_error"] = error[1]
+            result["refresh_error"] = "Archive update delayed. Cached observations remain available."
         result["server_ms"] = round((time.perf_counter() - started) * 1000, 3)
         return result
 
@@ -150,7 +227,7 @@ class SpherexHandler(SimpleHTTPRequestHandler):
         except (ValueError, TypeError) as exc:
             self._send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
         except Exception as exc:
-            self._send_json({"error": str(exc)}, HTTPStatus.BAD_GATEWAY)
+            self._send_json({"error": "The archive is temporarily unavailable. Please retry shortly."}, HTTPStatus.BAD_GATEWAY)
 
     def _get(self):
         parsed = urlparse(self.path)
@@ -202,7 +279,7 @@ class SpherexHandler(SimpleHTTPRequestHandler):
         except (ValueError, TypeError, KeyError) as exc:
             self._send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
         except Exception as exc:
-            self._send_json({"error": str(exc)}, HTTPStatus.BAD_GATEWAY)
+            self._send_json({"error": "The archive is temporarily unavailable. Please retry shortly."}, HTTPStatus.BAD_GATEWAY)
 
 
 def main():

@@ -9,7 +9,7 @@ import threading
 import time
 import xml.etree.ElementTree as ET
 import zlib
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import urlparse
@@ -123,7 +123,8 @@ def compute_spectral_fft(spectrum, wavelengths_um):
     coefficients = fft.rfft(values)
     frequency = fft.rfftfreq(values.size, d=spacing[0])
     k = np.arange(coefficients.size)
-    masks = {"low": k <= 6, "mid": (k >= 3) & (k <= 20), "high": k >= 12}
+    fraction = k / max(1, values.size // 2)
+    masks = {"low": fraction <= 1/3, "mid": (fraction > 1/3) & (fraction <= 2/3), "high": fraction > 2/3}
     return {
         "fft_amplitude": np.abs(coefficients).tolist(),
         "fft_frequency_per_um": frequency.tolist(),
@@ -196,9 +197,14 @@ class Archive:
         params += [("POS", f"CIRCLE {ra:.7f} {dec:.7f} 0"),
                    ("TIME", f"{now - window * 365.25:.5f} {now:.5f}"),
                    ("DPTYPE", "image"), ("MAXREC", 10000)]
+        search_key = "search:" + hashlib.sha256(json.dumps([ra, dec, window, collections]).encode()).hexdigest()
+        cached = self.cache.get(search_key)
+        if cached and time.time() - cached[0] < 3600:
+            return cached[1], collections
         rows, overflow = read_votable(self.fetch(SIA_URL, params))
         if overflow:
             raise ArchiveError("SIA result exceeded 10,000 images; choose a smaller field or time window")
+        self.cache.put(search_key, rows)
         return rows, collections
 
     def cutout(self, row, ra, dec, fov):
@@ -206,8 +212,9 @@ class Archive:
         parsed = urlparse(url)
         if parsed.scheme != "https" or parsed.hostname != "irsa.ipac.caltech.edu" or not parsed.path.startswith("/ibe/data/spherex/"):
             raise ArchiveError("SIA returned an unsupported cutout URL")
-        params = {"center": f"{ra:.7f},{dec:.7f}", "size": f"{fov * math.sqrt(2) / 3600:.9f}", "gzip": "false"}
-        key = "cutout:" + hashlib.sha256(json.dumps([CACHE_VERSION, url, params]).encode()).hexdigest()
+        native_fov = 600 * 2 ** max(0, math.ceil(math.log2(fov / 600)))
+        params = {"center": f"{ra:.7f},{dec:.7f}", "size": f"{native_fov * math.sqrt(2) / 3600:.9f}", "gzip": "false"}
+        key = "cutout:" + hashlib.sha256(json.dumps([CACHE_VERSION, url, params, fov]).encode()).hexdigest()
         cached = self.cache.get(key)
         if cached:
             return cached[1]
@@ -303,7 +310,9 @@ class Archive:
                                 "wise": row if kind == "wise" else None})
         return sources, errors
 
-    def build_sky(self, config, ra, dec, fov, window, release):
+    def build_sky(self, config, ra, dec, fov, window, release, progress=None):
+        report = progress or (lambda **kwargs: None)
+        report(phase="discovery", completed=0, total=0)
         rows, collections = self.search(ra, dec, fov, window, release)
         # prefer the newest processing of each exposure before sampling observations.
         unique = {}
@@ -324,15 +333,23 @@ class Archive:
                 selected.append(candidates[0])
                 if len(candidates) > 1:
                     selected.append(candidates[-1])
+        if not selected:
+            return dict(empty_sky(config, ra, dec, fov, window, release), data_status="empty",
+                        message="No data found for this field, release and time window. Try another location or release.",
+                        provenance={"sia_url": SIA_URL, "collections": collections, "matched_images": len(unique), "queried_at": Time.now().isot + "Z"})
         cutouts, failures = [], []
+        report(phase="cutouts", completed=0, total=len(selected))
         with ThreadPoolExecutor(max_workers=3) as pool:
             catalog_future = pool.submit(self.catalogs, ra, dec, fov)
-            futures = [(row, pool.submit(self.cutout, row, ra, dec, fov)) for row in selected]
-            for row, future in futures:
+            futures = {pool.submit(self.cutout, row, ra, dec, fov): row for row in selected}
+            for future in as_completed(futures):
+                row = futures[future]
                 try:
                     cutouts.append(future.result())
                 except Exception as exc:
                     failures.append({"url": row["access_url"], "error": str(exc)})
+                report(phase="cutouts", completed=len(cutouts)+len(failures), total=len(selected))
+            report(phase="catalogs", completed=len(selected), total=len(selected))
             sources, catalog_errors = catalog_future.result()
         if selected and not cutouts:
             raise ArchiveError("No selected cutout could be displayed: " + failures[0]["error"])
