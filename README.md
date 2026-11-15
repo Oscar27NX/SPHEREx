@@ -1,4 +1,4 @@
-# Uju Gaja — SPHEREx Sky Explorer
+# Uju Gaja — Interactive SPHEREx Visualization
 
 (Uju Gaja = "let's go to space!", in korean).
 
