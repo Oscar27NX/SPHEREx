@@ -707,10 +707,16 @@ function highlightEpochChip(activeIdx) {
 
 function updateTimelineCursor() {
   const active = getActiveEpochs();
-  const epoch = state.mode === "blink" && active.length ? active[state.cursorEpochPos % active.length].ep : null;
+  const current = state.mode === "blink" && active.length ? active[state.cursorEpochPos % active.length] : null;
+  const epoch = current?.ep;
   const cursor = d3.select("#timeline-svg .timeline-cursor");
   cursor.attr("visibility", epoch && timelineScale ? "visible" : "hidden");
   if (epoch && timelineScale) cursor.attr("x1", timelineScale(epoch.year)).attr("x2", timelineScale(epoch.year));
+  d3.select("#timeline-svg").selectAll(".observation-bar")
+    .classed("is-current", d => d.idx === current?.idx)
+    .attr("aria-pressed", d => String(d.idx === current?.idx))
+    .attr("opacity", d => d.ep.year >= state.winStart - epochWindowMargin()
+      && d.ep.year <= state.winEnd + epochWindowMargin() && state.epochOps[d.idx] !== "." ? 1 : .3);
 }
 
 function displayedEpochs() {
@@ -1237,6 +1243,42 @@ function renderFftSvg(source) {
   group.append("g").attr("class", "axis").call(d3.axisLeft(y).ticks(3));
 }
 
+function timelineObservationBars(epochs, scale) {
+  const ends = [];
+  return epochs.map((ep, idx) => ({ ep, idx, x: scale(ep.year) }))
+    .sort((a, b) => a.x - b.x || a.idx - b.idx)
+    .map(bar => {
+      let row = ends.findIndex(end => bar.x - 3 >= end + 1);
+      if (row < 0) row = ends.length;
+      ends[row] = bar.x + 3;
+      return { ...bar, row };
+    });
+}
+
+function inspectTimelineObservation(idx) {
+  const epoch = state.sky?.epochs[idx];
+  if (!epoch) return;
+  clearTimeout(refreshTimer);
+  skyController?.abort();
+  requestSerial++;
+  showRetrieval();
+  state.playing = false;
+  state.mode = "blink";
+  state.detector = epoch.detectors.length === 1 ? `D${epoch.detectors[0]}` : "all";
+  if (state.epochOps[idx] === ".") state.epochOps[idx] = "+";
+  state.winStart = Math.min(state.winStart, epoch.year);
+  state.winEnd = Math.max(state.winEnd, epoch.year);
+  state.cursorEpochPos = getActiveEpochs().findIndex(entry => entry.idx === idx);
+  document.getElementById("btn-play-pause").textContent = "Play";
+  syncControlUi();
+  renderEpochLegend();
+  renderTimelineBrush();
+  renderCurrentFrame();
+  renderSpectralCharts();
+  syncUrlHash();
+  document.querySelector(`.observation-bar[data-idx="${idx}"]`)?.focus();
+}
+
 function renderTimelineBrush() {
   if (!state.sky) return;
   const svgEl = document.getElementById("timeline-svg");
@@ -1263,19 +1305,30 @@ function renderTimelineBrush() {
 
   const g = svg.append("g").attr("transform", `translate(${margin.left},${margin.top})`);
 
-  g.selectAll("circle.ep-dot")
-    .data(epochs)
-    .join("circle")
-    .attr("class", "ep-dot")
-    .attr("cx", (d) => x(d.year))
-    .attr("cy", ih * 0.5)
-    .attr("r", 4.5)
-    .attr("visibility", "hidden");
-
-  g.selectAll("circle.ep-dot").append("title").text(d => `${d.label} (${d.source})`);
+  const observations = timelineObservationBars(epochs, x);
+  const rows = Math.max(...observations.map(d => d.row)) + 1;
+  const observationHeight = Math.min(ih * .45, Math.max(8, rows * 7));
+  const rowHeight = observationHeight / rows;
+  const observationLabel = d => `${d.ep.label} · ${d.ep.source} · MJD ${d.ep.mjd.toFixed(5)} · Click to inspect this observation`;
+  g.append("text").attr("x", 0).attr("y", -4).attr("fill", "#94a3b8")
+    .attr("font-size", 9).text("Click an observation bar to inspect");
+  g.selectAll("rect.observation-bar").data(observations).join("rect")
+    .attr("class", "observation-bar").attr("data-idx", d => d.idx)
+    .attr("x", d => d.x - 3).attr("y", d => 4 + d.row * rowHeight)
+    .attr("width", 6).attr("height", rowHeight * .8).attr("rx", 1)
+    .attr("fill", d => state.sky.detectors[d.ep.detectors[0] - 1]?.color || "#38bdf8")
+    .attr("role", "button").attr("tabindex", 0).attr("aria-label", observationLabel)
+    .on("click", (_, d) => inspectTimelineObservation(d.idx))
+    .on("keydown", (event, d) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        inspectTimelineObservation(d.idx);
+      }
+    })
+    .append("title").text(observationLabel);
 
   const brush = d3.brushX()
-    .extent([[0, 4], [iw, ih - 2]])
+    .extent([[0, observationHeight + 9], [iw, ih - 2]])
     .on("brush end", (event) => {
       if (!event.selection) return;
       const [x0, x1] = event.selection;

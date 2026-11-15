@@ -513,3 +513,13 @@ body.embed-mode #d3-drawer {
   pointer-events: none;
   text-shadow: 0 1px 3px black;
 }
+
+.observation-bar {
+  cursor: pointer;
+}
+
+.observation-bar.is-current,
+.observation-bar:focus-visible {
+  stroke: #fff;
+  stroke-width: 1;
+}
