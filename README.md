@@ -36,7 +36,7 @@ Alternatively, a demo containing only the data pertaining to the five challenge 
 
 - **Units & WCS**: Pixel values are measured surface brightness in **MJy/sr** from SPHEREx `IMAGE` HDUs. Wavelengths and bandwidths are read from the FITS spectral WCS in **µm** across the six detector arrays (`D1`–`D6`, `0.75–5.0 µm`) at original detector pixels without reapplying celestial SIP distortion.
 - **Viewing modes (`Blink`, `Mean (+)`, `Diff (-)`)**:
-  - **Blink**: Steps through selected epochs in time order. **RGB** maps `D5` → Red, `D3` → Green, `D1` → Blue using the nearest-in-time exposure in each channel (skipping duplicate combinations and falling back to labeled grayscale if a channel is missing in the active brush). Channel dates can differ; RGB is a false-color visualization, not simultaneous photometry or motion tracking.
+  - **Blink**: Steps through selected epochs in time order. **RGB** maps `D5` → Red, `D3` → Green, `D1` → Blue using the nearest-in-time exposure in each channel (skipping duplicate combinations and falling back to labeled grayscale if a channel is missing in the active brush).
   - **Mean (+)**: Averages finite pixels without null-filler detectors. **Spatial smoothing** applies a display-only `3×3` local mean; **Invert** flips the display stretch without modifying underlying data or masks.
   - **Diff (-) (Same-Band Subtraction)**: Subtracts earlier/`-` epochs from later/`+` epochs within the **same SPHEREx detector color band** (`D1`–`D6`). Single-band (`D1`–`D6`) and **RGB** views subtract within each band; **Available arrays** and **Spatial smoothing** compute per-band differences for every detector with `≥ 2` active epochs and average the valid difference maps together. You can click timeline epoch chips to cycle `+`, `-`, or `.` (skip), and drag the **Time Window Brush** to isolate specific date spans.
 - **Brightness spectrum & spectral FFT**: Plots center-pixel (with PSF-aperture fallback), clicked-pixel, or explicitly labeled **field-mean** brightness (`MJy/sr`) vs. wavelength (`µm`). When observations have irregular LVF wavelengths (minimum 4 finite samples, drawing across active exposures when needed), they are linearly resampled onto a uniform 32-point grid so `|FFT|` bar amplitudes vs. spectral period (`µm`) and additive **Low / Mid / High** reconstructions work cleanly on real cutouts.
@@ -45,7 +45,7 @@ Alternatively, a demo containing only the data pertaining to the five challenge 
 
 ## Used resources, datasets & licenses
 
-| Resource | Role in Uju Gaja | Source / Endpoint | License / Terms |
+| Resource | Role | Source / Endpoint | License / Terms |
 | --- | --- | --- | --- |
 | **NASA SPHEREx Mission Data** | Spectral-image discovery, FITS `IMAGE` cutouts, `FLAGS`, spectral `WCS-WAVE` | [IRSA SIA v2](https://irsa.ipac.caltech.edu/SIA) & [NASA/IPAC IRSA](https://irsa.ipac.caltech.edu/) (`/ibe/data/spherex/...`) | Public Domain / [NASA Open Data Policy](https://science.nasa.gov/open-science/open-data/) |
 | **Gaia DR3 (`gaia_dr3_source`)** | Proper-motion star overlay & catalog identification | [IRSA Gator Cone Search](https://irsa.ipac.caltech.edu/cgi-bin/Gator/nph-query) / [ESA Gaia DR3](https://www.cosmos.esa.int/web/gaia/dr3) | [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) (ESA / DPAC) |
