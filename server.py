@@ -47,7 +47,7 @@ def cached_preview(candidates, config, query):
     ra, dec, fov, window, release = query
     compatible = [item for item in candidates if item and item[1].get("epochs")
                   and all(field in item[1] for field in ("frames_b64", "flags_b64", "wavelength_maps_b64", "bandwidth_maps_b64"))
-                  and abs(item[1]["ra"] - ra) < 1e-6 and abs(item[1]["dec"] - dec) < 1e-6
+                  and abs((item[1]["ra"] - ra + 180.0) % 360.0 - 180.0) < 2e-4 and abs(item[1]["dec"] - dec) < 2e-4
                   and item[1]["window"] >= window]
     compatible.sort(key=lambda item: (item[1]["fov"] < fov, abs(item[1]["fov"] - fov), -item[0]))
     cutoff = Time.now().mjd - window * 365.25
@@ -89,13 +89,46 @@ class SkyEngine:
         self.lock = threading.Lock()
         self.memory = OrderedDict()
         with self.cache.connect() as db:
-            keys = [r[0] for r in db.execute("SELECT key FROM cache WHERE key LIKE 'sky:%' ORDER BY created DESC LIMIT 64")]
+            keys = [r[0] for r in db.execute("SELECT key FROM cache WHERE key LIKE 'sky:%' ORDER BY created DESC LIMIT 128")]
         for key in reversed(keys):
             self.memory[key] = self.cache.get(key)
         self.pending = {}
         self.errors = {}
         self.progress = {}
         self.ttl = float(os.environ.get("SPHEREX_CACHE_TTL", "604800"))
+
+    def _sky_key(self, query, sampling="preview"):
+        return "sky:" + hashlib.sha256(
+            json.dumps([CACHE_VERSION, *query, *([sampling] if sampling != "preview" else [])]).encode()
+        ).hexdigest()
+
+    def _resolve_cached_coords(self, ra, dec, fov=None, window=None, release="auto", sampling="preview", tol=2e-4):
+        presets = self.config.get("preset_targets", [])
+        with self.lock:
+            mem_keys = set(self.memory.keys())
+            mem_values = [item[1] for item in self.memory.values()
+                          if item and item[1].get("data_status") == "ready" and item[1].get("epochs")]
+        candidates = {}
+        for is_preset, items in ((True, presets), (False, mem_values)):
+            for cand in items:
+                c_ra, c_dec = cand.get("ra"), cand.get("dec")
+                if c_ra is None or c_dec is None:
+                    continue
+                coord = (round(float(c_ra) % 360.0, 6), round(float(c_dec), 6))
+                dra = abs((coord[0] - ra + 180.0) % 360.0 - 180.0)
+                ddec = abs(coord[1] - dec)
+                if dra < tol and ddec < tol and coord not in candidates:
+                    candidates[coord] = (is_preset, dra * dra + ddec * ddec)
+        best, best_score = None, None
+        for coord, (is_preset, d2) in candidates.items():
+            has_hit = False
+            if fov is not None and window is not None:
+                cand_key = self._sky_key((*coord, fov, window, release or "auto"), sampling)
+                has_hit = cand_key in mem_keys or self.cache.get(cand_key) is not None
+            score = (0 if has_hit else 1, 0 if is_preset else 1, d2)
+            if best is None or score < best_score:
+                best, best_score = coord, score
+        return best or (ra, dec)
 
     def configuration(self):
         config = dict(self.config)
@@ -104,6 +137,33 @@ class SkyEngine:
         config["releases"] = [{"id": "auto", "label": "All current releases"}] + [
             {"id": name, "label": name.replace("spherex_", "SPHEREx ").upper()}
             for name in collections if not name.endswith("_deep")]
+        preset_coords = {
+            normalize_query(p["ra"], p["dec"], p.get("fov", 300), 10.0, "auto")[:2]
+            for p in self.config.get("preset_targets", [])
+            if p.get("ra") is not None and p.get("dec") is not None
+        }
+        with self.lock:
+            entries = list(self.memory.items())
+        valid = []
+        for key, item in entries:
+            payload = item[1] if item else None
+            if not payload or payload.get("data_status") != "ready" or not payload.get("epochs"):
+                continue
+            q = normalize_query(payload["ra"], payload["dec"], payload["fov"], 10.0, "auto")
+            if key != self._sky_key(q):
+                continue
+            coord = (q[0], q[1])
+            valid.append((coord in preset_coords, coord, payload))
+        # keep canonical preset coordinates ahead of rounded near-duplicates.
+        valid.sort(key=lambda entry: not entry[0])
+        kept, targets = [], []
+        for _, coord, payload in valid:
+            if any(abs((coord[0] - kr + 180.0) % 360.0 - 180.0) < 2e-4 and abs(coord[1] - kd) < 2e-4
+                   for kr, kd in kept):
+                continue
+            kept.append(coord)
+            targets.append({"ra": payload["ra"], "dec": payload["dec"], "fov": payload["fov"]})
+        config["cached_targets"] = targets
         return config
 
     def _refresh(self, key, query, sampling="preview"):
@@ -118,7 +178,7 @@ class SkyEngine:
                 self.errors.pop(key, None)
                 self.memory[key] = (time.time(), payload)
                 self.memory.move_to_end(key)
-                while len(self.memory) > 64:
+                while len(self.memory) > 128:
                     self.memory.popitem(last=False)
             return payload
         except Exception as exc:
@@ -129,25 +189,40 @@ class SkyEngine:
             with self.lock:
                 self.progress.pop(key, None)
 
+    def _lookup_cached(self, key):
+        with self.lock:
+            cached = self.memory.get(key)
+            if cached:
+                self.memory.move_to_end(key)
+                return cached
+        cached = self.cache.get(key)
+        if cached:
+            with self.lock:
+                self.memory[key] = cached
+                while len(self.memory) > 128:
+                    self.memory.popitem(last=False)
+        return cached
+
     def get_sky_cube(self, ra, dec, fov_arcsec=300, window_years=10, release_id="auto", wait=False, force=False, sampling="preview"):
         started = time.perf_counter()
         if sampling not in ("preview", "rgb"):
             raise ValueError("Unknown observation sampling")
         query = normalize_query(ra, dec, fov_arcsec, window_years, release_id or "auto")
-        key = "sky:" + hashlib.sha256(json.dumps([CACHE_VERSION, *query, *([sampling] if sampling != "preview" else [])]).encode()).hexdigest()
-        with self.lock:
-            cached = self.memory.get(key)
-            if cached:
-                self.memory.move_to_end(key)
+        key = self._sky_key(query, sampling)
+        cached = self._lookup_cached(key)
         if cached is None:
-            cached = self.cache.get(key)
-            if cached:
-                with self.lock:
-                    self.memory[key] = cached
-                    while len(self.memory) > 24:
-                        self.memory.popitem(last=False)
-        stale = cached is None or time.time() - cached[0] >= self.ttl or force
+            # match rounded share-url or coordinate-input values to their canonical cached target.
+            snapped = self._resolve_cached_coords(query[0], query[1], query[2], query[3], query[4], sampling)
+            if snapped != (query[0], query[1]):
+                query = (*snapped, query[2], query[3], query[4])
+                key = self._sky_key(query, sampling)
+                cached = self._lookup_cached(key)
         with self.lock:
+            if cached is None:
+                cached = self.memory.get(key)
+                if cached:
+                    self.memory.move_to_end(key)
+            stale = cached is None or time.time() - cached[0] >= self.ttl or force
             future = self.pending.get(key)
             if future and future.done():
                 self.pending.pop(key, None)

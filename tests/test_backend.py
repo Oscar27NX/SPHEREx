@@ -412,6 +412,42 @@ class EngineTests(unittest.TestCase):
                 gate.set()
                 engine.pool.shutdown()
 
+    def test_rounded_share_url_and_input_coords_hit_cached_sky_and_footprint_fallback(self):
+        config = load_config()
+        preset = config["preset_targets"][0]
+        class RecordingArchive:
+            calls = []
+            def collections(self):
+                return ["spherex_dr1"]
+            def build_sky(self, cfg, ra, dec, fov, window, release, **kwargs):
+                self.calls.append((ra, dec, fov))
+                return dict(empty_sky(cfg, ra, dec, fov, window, release), data_status="ready", epochs=[{"mjd": 61000.0, "source": "spherex_dr1", "detectors": [1]}])
+        with tempfile.TemporaryDirectory() as directory:
+            rec = RecordingArchive()
+            engine = SkyEngine(directory, rec)
+            try:
+                engine.get_sky_cube(preset["ra"], preset["dec"], preset["fov"], wait=True)
+                engine.get_sky_cube(29.815712, 32.885341, 300, wait=True)
+                rec.calls.clear()
+                share_hit = engine.get_sky_cube(float(f"{preset['ra']:.5f}"), float(f"{preset['dec']:.5f}"), preset["fov"])
+                go_hit = engine.get_sky_cube(float(f"{preset['ra']:.4f}"), float(f"{preset['dec']:.4f}"), preset["fov"])
+                rand_go_hit = engine.get_sky_cube(29.8157, 32.8853, 300)
+                for hit in (share_hit, go_hit, rand_go_hit):
+                    self.assertEqual(hit["cache"], "HIT")
+                    self.assertEqual(hit["data_status"], "ready")
+                self.assertEqual(rec.calls, [])
+                self.assertGreaterEqual(len(engine.configuration()["cached_targets"]), 2)
+                archive = Archive(engine.cache, lambda url, params: (_ for _ in ()).throw(RuntimeError("502 upstream down")))
+                engine.cache.put("collections", ["spherex_dr1"])
+                engine.cache.put("search:seed", [{"obs_id": "cov1", "obs_collection": "spherex_dr1",
+                                                  "t_min": Time.now().mjd - 5, "access_url": "https://irsa.ipac.caltech.edu/ibe/data/spherex/dr1/cov1D1_x.fits",
+                                                  "s_region": "POLYGON ICRS 19 0 21 0 21 2 19 2"}])
+                rows, cols = archive.search(20.1, 1.1, 300, 10, "auto")
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(rows[0]["obs_id"], "cov1")
+            finally:
+                engine.pool.shutdown()
+
 
 if __name__ == "__main__":
     unittest.main()

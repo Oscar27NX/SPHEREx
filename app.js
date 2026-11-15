@@ -57,6 +57,31 @@ function parseCoordinate(value, isRa = false) {
   return sign * (deg + min / 60 + sec / 3600) * scale;
 }
 
+function resolveKnownCoords(ra, dec, tol = 2e-4) {
+  if (!Number.isFinite(ra) || !Number.isFinite(dec)) return [ra, dec];
+  const candidates = [];
+  if (state.sky?.epochs?.length && state.sky.data_status !== "error") candidates.push(state.sky);
+  if (state.config?.preset_targets) candidates.push(...state.config.preset_targets);
+  if (state.config?.cached_targets) candidates.push(...state.config.cached_targets);
+  for (const entry of state.clientCache.values()) {
+    if (entry?.sky?.epochs?.length && entry.sky.data_status !== "error") candidates.push(entry.sky);
+  }
+  let best = null, bestD2 = tol * tol;
+  for (const c of candidates) {
+    if (!Number.isFinite(c?.ra) || !Number.isFinite(c?.dec)) continue;
+    const dra = Math.abs((((c.ra - ra + 180) % 360) + 360) % 360 - 180);
+    const ddec = Math.abs(c.dec - dec);
+    if (dra < tol && ddec < tol) {
+      const d2 = dra * dra + ddec * ddec;
+      if (!best || d2 < bestD2) {
+        best = [c.ra >= 0 && c.ra < 360 ? c.ra : ((c.ra % 360) + 360) % 360, c.dec];
+        bestD2 = d2;
+      }
+    }
+  }
+  return best || [ra, dec];
+}
+
 function parseUrlParams() {
   const merged = new URLSearchParams(window.location.search);
   const hash = window.location.hash.replace(/^#/, "");
@@ -72,6 +97,7 @@ function parseUrlParams() {
     const parsedDec = parseCoordinate(merged.get("dec"), false);
     if (Number.isFinite(parsedRa)) state.ra = ((parsedRa % 360) + 360) % 360;
     if (Number.isFinite(parsedDec)) state.dec = Math.max(-89.9, Math.min(89.9, parsedDec));
+    [state.ra, state.dec] = resolveKnownCoords(state.ra, state.dec);
   }
   if (merged.has("fov")) {
     const f = Number.parseFloat(merged.get("fov"));
@@ -265,7 +291,7 @@ function rememberSky(sky) {
 
 function cachedSkyPreview(ra, dec, fov, win, releaseId, sampling = "preview") {
   const candidates = Array.from(state.clientCache.values(), entry => entry.sky)
-    .filter(s => s.epochs?.length && Math.abs(s.ra - ra) < 1e-6 && Math.abs(s.dec - dec) < 1e-6 && s.window >= win)
+    .filter(s => s.epochs?.length && Math.abs((((s.ra - ra + 180) % 360) + 360) % 360 - 180) < 2e-4 && Math.abs(s.dec - dec) < 2e-4 && s.window >= win)
     .sort((a, b) => (sampling === "rgb" ? Number(a.sampling !== "rgb") - Number(b.sampling !== "rgb") : 0)
       || Number(a.fov < fov) - Number(b.fov < fov) || Math.abs(a.fov - fov) - Math.abs(b.fov - fov)
       || b.epochs.length - a.epochs.length);
@@ -312,7 +338,7 @@ function cachedSkyPreview(ra, dec, fov, win, releaseId, sampling = "preview") {
   return null;
 }
 
-async function querySky(ra, dec, fov = state.fov, win = state.windowYears, releaseId = state.releaseId) {
+async function querySky(ra, dec, fov = state.fov, win = state.windowYears, releaseId = state.releaseId, fromRandom = false) {
   const serial = ++requestSerial;
   clearTimeout(refreshTimer);
   skyController?.abort();
@@ -322,6 +348,7 @@ async function querySky(ra, dec, fov = state.fov, win = state.windowYears, relea
     return;
   }
   ra = ((ra % 360) + 360) % 360;
+  [ra, dec] = resolveKnownCoords(ra, dec);
   const sampling = state.detector === "rgb" ? "rgb" : "preview";
   const key = skyCacheKey(ra, dec, fov, win, releaseId, sampling);
   const cached = state.clientCache.get(key);
@@ -340,6 +367,15 @@ async function querySky(ra, dec, fov = state.fov, win = state.windowYears, relea
     const sky = await resp.json();
     if (!resp.ok) throw new Error("Archive unavailable");
     if (serial !== requestSerial) return;
+    if (sky.data_status === "error" && fromRandom) {
+      const pool = (state.config?.cached_targets?.length ? state.config.cached_targets : state.config?.preset_targets) || [];
+      const others = pool.filter(t => Math.abs(t.ra - state.ra) > 1e-3 || Math.abs(t.dec - state.dec) > 1e-3);
+      const picks = others.length ? others : pool;
+      if (picks.length) {
+        const chosen = picks[Math.floor(Math.random() * picks.length)];
+        return querySky(chosen.ra, chosen.dec, fov, win, releaseId, false);
+      }
+    }
     showRetrieval(sky);
     rememberSky(sky);
     const richerPreview = sky.preview && state.sky?.sampling === "rgb" && state.sky.epochs.length > sky.epochs.length
@@ -351,11 +387,11 @@ async function querySky(ra, dec, fov = state.fov, win = state.windowYears, relea
     }
     if (sky.data_status === "loading" || sky.refreshing) {
       refreshTimer = setTimeout(() => {
-        if (serial === requestSerial) querySky(ra, dec, fov, win, releaseId);
+        if (serial === requestSerial) querySky(ra, dec, fov, win, releaseId, fromRandom);
       }, sky.epochs?.length ? 2000 : 500);
     } else if (["ready", "empty", "error"].includes(sky.data_status)) {
       refreshTimer = setTimeout(() => {
-        if (serial === requestSerial) querySky(ra, dec, fov, win, releaseId);
+        if (serial === requestSerial) querySky(ra, dec, fov, win, releaseId, false);
       }, 60000);
     }
   } catch (error) {
@@ -363,7 +399,7 @@ async function querySky(ra, dec, fov = state.fov, win = state.windowYears, relea
       showRetrieval();
       setDataStatus("Unable to contact the archive. Your current view is preserved; retrying shortly.");
       refreshTimer = setTimeout(() => {
-        if (serial === requestSerial) querySky(ra, dec, fov, win, releaseId);
+        if (serial === requestSerial) querySky(ra, dec, fov, win, releaseId, false);
       }, 10000);
     }
   } finally { clearTimeout(timeout); }
@@ -395,6 +431,31 @@ function asinhStretch(val, minB = -0.25, maxB = 8.5, beta = 1.6) {
   return state.invert ? 1 - norm : norm;
 }
 
+function smoothSpatialPlane(buf, grid) {
+  const original = buf.slice();
+  for (let y = 0; y < grid; y++) for (let x = 0; x < grid; x++) {
+    let sum = 0, hits = 0;
+    for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+      const nx = x + dx, ny = y + dy;
+      if (nx < 0 || ny < 0 || nx >= grid || ny >= grid) continue;
+      const value = original[ny * grid + nx];
+      if (Number.isFinite(value)) { sum += value; hits++; }
+    }
+    buf[y * grid + x] = Number.isFinite(original[y * grid + x]) && hits ? sum / hits : NaN;
+  }
+}
+
+function detectorBandIndex(wavelengthUm) {
+  if (!Number.isFinite(wavelengthUm)) return -1;
+  if (wavelengthUm >= 0.70 && wavelengthUm <= 1.095) return 0;
+  if (wavelengthUm > 1.095 && wavelengthUm <= 1.625) return 1;
+  if (wavelengthUm > 1.625 && wavelengthUm <= 2.415) return 2;
+  if (wavelengthUm > 2.415 && wavelengthUm <= 3.825) return 3;
+  if (wavelengthUm > 3.825 && wavelengthUm <= 4.415) return 4;
+  if (wavelengthUm > 4.415 && wavelengthUm <= 5.05) return 5;
+  return -1;
+}
+
 function samplePlane(epochIdx, detSpec, outBuf) {
   const { frames, grid, nDet } = state.decoded;
   const count = grid * grid;
@@ -408,45 +469,57 @@ function samplePlane(epochIdx, detSpec, outBuf) {
     }
     outBuf[p] = hits ? sum / hits : NaN;
   }
-  if (detSpec === "fft2d") {
-    const original = outBuf.slice();
-    for (let y = 0; y < grid; y++) for (let x = 0; x < grid; x++) {
-      let sum = 0, hits = 0;
-      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
-        const nx = x + dx, ny = y + dy;
-        if (nx < 0 || ny < 0 || nx >= grid || ny >= grid) continue;
-        const value = original[ny * grid + nx];
-        if (Number.isFinite(value)) { sum += value; hits++; }
-      }
-      outBuf[y * grid + x] = Number.isFinite(original[y * grid + x]) && hits ? sum / hits : NaN;
-    }
-  }
+  if (detSpec === "fft2d") smoothSpatialPlane(outBuf, grid);
 }
 
 function accumulateComposite(active, detSpec, outBuf) {
+  if (state.mode === "diff" && (detSpec === "all" || detSpec === "fft2d") && active.some(a => a.ep?.detectors?.length)) {
+    const bandBuf = new Float32Array(outBuf.length);
+    const sum = new Float64Array(outBuf.length);
+    const hits = new Uint16Array(outBuf.length);
+    for (let d = 1; d <= 6; d += 1) {
+      const detActive = active.filter(a => a.ep.detectors.includes(d));
+      if (detActive.length < 2) continue;
+      accumulateComposite(detActive, `D${d}`, bandBuf);
+      for (let p = 0; p < outBuf.length; p += 1) {
+        if (Number.isFinite(bandBuf[p])) { sum[p] += bandBuf[p]; hits[p] += 1; }
+      }
+    }
+    for (let p = 0; p < outBuf.length; p += 1) outBuf[p] = hits[p] ? sum[p] / hits[p] : NaN;
+    if (detSpec === "fft2d") smoothSpatialPlane(outBuf, state.decoded.grid);
+    return;
+  }
+  const entries = detSpec.startsWith("D") && active.some(a => a.ep?.detectors?.length)
+    ? active.filter(a => a.ep.detectors.includes(Number(detSpec.slice(1)))) : active;
+  if (!entries.length) { outBuf.fill(NaN); return; }
   const tmp = new Float32Array(outBuf.length);
   const positive = new Float64Array(outBuf.length), negative = new Float64Array(outBuf.length);
   const plusCount = new Uint16Array(outBuf.length), minusCount = new Uint16Array(outBuf.length);
-  const explicitMinus = active.some(a => a.op === "-");
-  active.forEach((entry, index) => {
+  const firstBand = state.mode === "diff" ? new Int8Array(outBuf.length).fill(-1) : null;
+  const compat = state.mode === "diff" ? new Uint8Array(outBuf.length).fill(1) : null;
+  const wavelengths = state.decoded?.wavelengths;
+  const explicitMinus = entries.some(a => a.op === "-");
+  entries.forEach((entry, index) => {
     samplePlane(entry.idx, detSpec, tmp);
-    const minus = entry.op === "-" || (state.mode === "diff" && !explicitMinus && index < Math.floor(active.length / 2));
+    const minus = entry.op === "-" || (state.mode === "diff" && !explicitMinus && index < Math.floor(entries.length / 2));
     for (let p = 0; p < outBuf.length; p++) if (Number.isFinite(tmp[p])) {
+      if (state.mode === "diff") {
+        // compare epochs across the same detector color band rather than exact sub-channel wavelengths.
+        const w = wavelengths?.[entry.idx * outBuf.length + p];
+        const band = entry.ep?.detectors?.length === 1 && Number.isFinite(w)
+          ? entry.ep.detectors[0] - 1
+          : detectorBandIndex(w);
+        if (band < 0) compat[p] = 0;
+        else if (firstBand[p] === -1) firstBand[p] = band;
+        else if (band !== firstBand[p]) compat[p] = 0;
+      }
       if (minus) { negative[p] += tmp[p]; minusCount[p]++; }
       else { positive[p] += tmp[p]; plusCount[p]++; }
     }
   });
   for (let p = 0; p < outBuf.length; p++) {
     if (state.mode === "diff") {
-      const { wavelengths, bandwidths } = state.decoded;
-      const first = active[0].idx * outBuf.length + p;
-      const compatible = active.every(a => {
-        const offset = a.idx * outBuf.length + p;
-        const tolerance = Math.min(bandwidths[first], bandwidths[offset]) * .25;
-        return Number.isFinite(wavelengths[offset]) && tolerance > 0
-          && Math.abs(wavelengths[offset] - wavelengths[first]) <= tolerance;
-      });
-      outBuf[p] = compatible && plusCount[p] && minusCount[p] ? positive[p] / plusCount[p] - negative[p] / minusCount[p] : NaN;
+      outBuf[p] = compat[p] && plusCount[p] && minusCount[p] ? positive[p] / plusCount[p] - negative[p] / minusCount[p] : NaN;
     }
     else outBuf[p] = plusCount[p] + minusCount[p] ? (positive[p] - negative[p]) / (plusCount[p] + minusCount[p]) : NaN;
   }
@@ -522,8 +595,8 @@ function renderCurrentFrame() {
         : "No observations for this selection. Try Available arrays, widen the time brush, or choose another release or target.");
     renderSkyOverlay(); return;
   }
-  if (state.mode === "diff" && (!state.detector.startsWith("D") || active.length < 2)) {
-    showEmpty("Choose one detector and at least two epochs to compare wavelengths");
+  if (state.mode === "diff" && active.length < 2) {
+    showEmpty("Select at least two epochs to compare same-band observations");
     renderSkyOverlay();
     return;
   }
@@ -554,7 +627,7 @@ function renderCurrentFrame() {
     highlightEpochChip(slot.idx);
   } else {
     specs.forEach((spec, i) => accumulateComposite(active, spec, buffers[i]));
-    readout.textContent = state.mode === "diff" ? "Difference preview · wavelength mismatch pixels masked"
+    readout.textContent = state.mode === "diff" ? "Difference preview · same-band epoch subtraction"
       : `Mean of ${active.length} observations · mixed wavelengths`;
     highlightEpochChip(-1);
   }
@@ -572,7 +645,7 @@ function renderCurrentFrame() {
     stretchCache.set(key, limits);
     return limits;
   });
-  if (!buffers.some(b => b.some(Number.isFinite))) showEmpty("No valid pixels with matching wavelength coverage. Try Blink or Mean with Available arrays.");
+  if (!buffers.some(b => b.some(Number.isFinite))) showEmpty("No valid pixels with same-band multi-epoch coverage. Try Blink, Mean, or widen the time brush.");
   const image = ctx.createImageData(grid, grid);
   for (let p = 0; p < grid * grid; p++) {
     let valid = true;
@@ -642,7 +715,7 @@ function updateTimelineCursor() {
 
 function displayedEpochs() {
   const active = getActiveEpochs();
-  if (state.mode === "diff" && (!state.detector.startsWith("D") || active.length < 2)) return [];
+  if (state.mode === "diff" && active.length < 2) return [];
   if (state.mode === "blink") {
     if (!active.length) return [];
     const slot = active[state.cursorEpochPos % active.length];
@@ -1347,7 +1420,7 @@ function bindEvents() {
   document.getElementById("btn-random").addEventListener("click", () => {
     const randRa = Math.random() * 360.0;
     const randDec = (Math.random() * 160.0) - 80.0;
-    querySky(randRa, randDec, state.fov);
+    querySky(randRa, randDec, state.fov, state.windowYears, state.releaseId, true);
   });
 
   document.getElementById("release-select").addEventListener("change", (ev) => {
@@ -1665,6 +1738,8 @@ async function init() {
   if (!hasUrlCoords) {
     state.ra = boot.config.preset_targets[0].ra;
     state.dec = boot.config.preset_targets[0].dec;
+  } else {
+    [state.ra, state.dec] = resolveKnownCoords(state.ra, state.dec);
   }
   await querySky(state.ra, state.dec, state.fov, state.windowYears, state.releaseId);
 

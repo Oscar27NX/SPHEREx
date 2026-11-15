@@ -413,3 +413,51 @@ test('sexagesimal and decimal coordinates parse accurately in inputs and URL par
   assert.ok(Math.abs(vm.runInContext('state.ra', context) - expectedRa) < 1e-10);
   assert.ok(Math.abs(vm.runInContext('state.dec', context) - expectedDec) < 1e-10);
 });
+
+test('rounded share URL and Go coordinates snap to known cached targets', async () => {
+  const fetches = [];
+  const context = appContext({
+    fetch: async url => {
+      fetches.push(url);
+      return { ok: true, json: async () => ({ ra: 269.446259, dec: 4.768324, fov: 300, window: 10, release: { id: 'auto' }, data_status: 'ready', epochs: [{ mjd: 61000, source: 'spherex_dr1', detectors: [1], year: 2026 }], detectors: Array(6).fill({}), sources: [], measurements: [], grid_size: 1, frames_b64: 'AACAPwAAgD8AAIA/AACAPwAAgD8AAIA/', flags_b64: 'AAAAAA==', wavelength_maps_b64: 'AACAPw==', bandwidth_maps_b64: 'zczMPQ==' }) };
+    }
+  });
+  vm.runInContext(`state.config={preset_targets:[{ra:269.4462585589701,dec:4.768324479905898,fov:300}],cached_targets:[{ra:29.815712,dec:32.885341,fov:300}]};
+    globalThis.applied=[];applySkyData=sky=>applied.push([sky.ra,sky.dec]);
+    rememberSky({ra:269.446259,dec:4.768324,fov:300,window:10,release:{id:'auto'},data_status:'ready',epochs:[{}]});`, context);
+  await vm.runInContext('querySky(269.4463, 4.7683, 300)', context);
+  assert.equal(context.applied[0][0], 269.446259);
+  assert.equal(Number(new URL(fetches[0], 'http://local').searchParams.get('ra')), 269.446259);
+  const snapped = vm.runInContext('resolveKnownCoords(29.81571, 32.88534)', context);
+  assert.deepEqual(Array.from(snapped), [29.815712, 32.885341]);
+});
+
+test('diff mode subtracts same-band epochs across LVF wavelengths and stacks available arrays', () => {
+  const context = appContext();
+  const res = vm.runInContext(`state.mode='diff';
+    state.decoded={grid:1,nDet:6,
+      frames:new Float32Array([
+        0,NaN,NaN,NaN,10,NaN,
+        0,NaN,NaN,NaN,18,NaN,
+        3,NaN,NaN,NaN,0,NaN,
+        9,NaN,NaN,NaN,0,NaN
+      ]),
+      wavelengths:new Float32Array([3.90,4.32,0.85,0.98]),
+      bandwidths:new Float32Array([0.04,0.04,0.02,0.02])
+    };
+    state.decoded.frames[0]=NaN; state.decoded.frames[6]=NaN;
+    state.decoded.frames[16]=NaN; state.decoded.frames[22]=NaN;
+    globalThis.buf=new Float32Array(1);
+    globalThis.active=[
+      {idx:0,op:'+',ep:{detectors:[5]}},
+      {idx:1,op:'+',ep:{detectors:[5]}},
+      {idx:2,op:'+',ep:{detectors:[1]}},
+      {idx:3,op:'+',ep:{detectors:[1]}}
+    ];
+    accumulateComposite(active,'D5',buf);
+    const d5 = buf[0];
+    accumulateComposite(active,'all',buf);
+    ({d5, all: buf[0]})`, context);
+  assert.equal(res.d5, 8);
+  assert.equal(res.all, 7);
+});

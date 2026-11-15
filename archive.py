@@ -275,6 +275,26 @@ class Archive:
         except Exception:
             if cached:
                 return cached[1], collections
+            if hasattr(self.cache, "connect"):
+                cutoff = now - window * 365.25
+                seen_rows, matched = set(), []
+                with self.cache.connect() as db:
+                    cached_searches = db.execute("SELECT body FROM cache WHERE key LIKE 'search:%' ORDER BY created DESC").fetchall()
+                for (blob,) in cached_searches:
+                    for row in json.loads(zlib.decompress(blob)):
+                        t_min = row.get("t_min")
+                        if t_min is None or t_min < cutoff or t_min > now:
+                            continue
+                        if row.get("obs_collection") and row.get("obs_collection") not in collections:
+                            continue
+                        if not covers_center(row, ra, dec):
+                            continue
+                        row_id = (row.get("obs_id"), detector_number(row), row.get("access_url"))
+                        if row_id not in seen_rows:
+                            seen_rows.add(row_id)
+                            matched.append(row)
+                if matched:
+                    return matched, collections
             raise
 
     def cutout(self, row, ra, dec, fov):
