@@ -90,7 +90,8 @@ const {chromium}=require('../.cache/browser/node_modules/playwright');
     await page.reload();
     await page.waitForFunction(()=>document.querySelector('#btn-fft-demo').getAttribute('aria-pressed')==='true');
     await page.locator('#btn-fft-demo').click();
-    assert.equal(await page.locator('[data-fft="low"]').isDisabled(),true);
+    assert.equal(await page.locator('[data-fft="low"]').isDisabled(),false);
+    assert.equal(await page.locator('#fft-svg rect').count(),17);
 
     loading=true;
     await page.locator('#btn-random').click();
@@ -100,6 +101,7 @@ const {chromium}=require('../.cache/browser/node_modules/playwright');
     await page.waitForFunction(()=>document.querySelector('#data-status').textContent.includes('No data found'));
     assert.equal(await page.locator('#retrieval-progress').isVisible(),false);
     assert.equal(await page.locator('#empty-view').isVisible(),true);
+    assert.equal(await page.locator('[data-fft="low"]').isDisabled(),true);
     assert.deepEqual(errors,[]);
     await page.screenshot({path:'.cache/sprint-empty-state.png'});
     console.log('Sprint checks passed: RGB playback and later queries, Gaia epoch motion, WISE FOV/zoom/mode/brush alignment, spectrum-only FFT demo and share URL, random-field progress to empty result.');

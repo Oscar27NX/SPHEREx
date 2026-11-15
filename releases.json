@@ -133,6 +133,13 @@
       "severity": "warn"
     },
     {
+      "bit": 14,
+      "name": "PHANMISS",
+      "label": "Missing Phantom Pixel",
+      "color": "#94a3b8",
+      "severity": "warn"
+    },
+    {
       "bit": 15,
       "name": "NONLINEAR",
       "label": "Non-linear Response",
@@ -175,11 +182,32 @@
       "severity": "high"
     },
     {
+      "bit": 23,
+      "name": "GHOST_FPA",
+      "label": "Focal Plane Ghost",
+      "color": "#f59e0b",
+      "severity": "high"
+    },
+    {
       "bit": 24,
+      "name": "GHOST_EXT",
+      "label": "Extended Ghost",
+      "color": "#fb923c",
+      "severity": "high"
+    },
+    {
+      "bit": 25,
       "name": "STREAK",
       "label": "Satellite / Asteroid Streak",
       "color": "#38bdf8",
       "severity": "high"
+    },
+    {
+      "bit": 26,
+      "name": "BLOOM",
+      "label": "Charge Blooming",
+      "color": "#fb7185",
+      "severity": "warn"
     },
     {
       "bit": 27,

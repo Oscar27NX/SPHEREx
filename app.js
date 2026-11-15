@@ -264,7 +264,15 @@ function cachedSkyPreview(ra, dec, fov, win, releaseId) {
       measurements: (source.measurements || []).filter(m => included.has(`${m.mjd}|${m.detector}`)),
       sources: source.sources.map(s => ({ ...s, px: (s.px - grid / 2) * source.fov / fov + grid / 2, py: (s.py - grid / 2) * source.fov / fov + grid / 2 }))
     };
-    sky.sources = sky.sources.filter(s => s.px >= 0 && s.px < grid && s.py >= 0 && s.py < grid);
+    sky.sources = sky.sources.filter(s => {
+      if (s.px >= 0 && s.px < grid && s.py >= 0 && s.py < grid) return true;
+      if (!s.gaia || !Number.isFinite(s.pmra_mas_yr) || !Number.isFinite(s.pmdec_mas_yr)) return false;
+      const dt = 2026.5 - (s.reference_epoch || 2016.0);
+      const scale = fov / grid;
+      const ppx = s.px - (s.pmra_mas_yr * dt / 1000) / scale;
+      const ppy = s.py - (s.pmdec_mas_yr * dt / 1000) / scale;
+      return ppx >= 0 && ppx < grid && ppy >= 0 && ppy < grid;
+    });
     decodedCache.set(sky, decoded);
     return sky;
   }
@@ -320,12 +328,17 @@ async function querySky(ra, dec, fov = state.fov, win = state.windowYears, relea
   } finally { clearTimeout(timeout); }
 }
 
+function epochWindowMargin() {
+  return 0.01;
+}
+
 function getActiveEpochs() {
   if (!state.sky) return [];
+  const margin = epochWindowMargin();
   const active = [];
   for (let i = 0; i < state.sky.epochs.length; i += 1) {
     const ep = state.sky.epochs[i];
-    const inWin = ep.year >= state.winStart - 0.01 && ep.year <= state.winEnd + 0.01;
+    const inWin = ep.year >= state.winStart - margin && ep.year <= state.winEnd + margin;
     const op = state.epochOps[i] || "+";
     const available = !state.detector.startsWith("D") || ep.detectors.includes(Number(state.detector.slice(1)));
     if (inWin && available && op !== ".") active.push({ idx: i, ep, op });
@@ -518,11 +531,12 @@ function renderEpochLegend() {
   const container = document.getElementById("epoch-legend");
   container.innerHTML = "";
   if (!state.sky) return;
+  const margin = epochWindowMargin();
   state.sky.epochs.forEach((ep, idx) => {
     const chip = document.createElement("button");
     chip.className = "epoch-chip";
     chip.dataset.idx = String(idx);
-    const inWin = ep.year >= state.winStart - 0.01 && ep.year <= state.winEnd + 0.01;
+    const inWin = ep.year >= state.winStart - margin && ep.year <= state.winEnd + margin;
     chip.classList.add(inWin ? "in-window" : "out-window");
     const op = state.epochOps[idx] || "+";
     const opClass = op === "+" ? "op-plus" : op === "-" ? "op-minus" : "op-skip";
@@ -533,6 +547,7 @@ function renderEpochLegend() {
       state.epochOps[idx] = next;
       renderEpochLegend();
       renderCurrentFrame();
+      renderSpectralCharts();
     });
     container.appendChild(chip);
   });
@@ -555,6 +570,7 @@ function updateTimelineCursor() {
 
 function displayedEpochs() {
   const active = getActiveEpochs();
+  if (state.mode === "diff" && (!state.detector.startsWith("D") || active.length < 2)) return [];
   if (state.mode === "blink") {
     if (!active.length) return [];
     const slot = active[state.cursorEpochPos % active.length];
@@ -570,9 +586,61 @@ function displayedEpochs() {
   return active;
 }
 
-const displayFlagMask = [0, 1, 2, 6, 7, 9, 10, 11, 15, 17, 19, 20, 22, 24, 27, 28].reduce((mask, bit) => mask | (1 << bit), 0);
+const displayFlagMask = [0, 1, 2, 6, 7, 9, 10, 11, 14, 15, 17, 19, 20, 22, 23, 24, 25, 26, 27, 28].reduce((mask, bit) => mask | (1 << bit), 0);
+const badPixelMask = [1, 2, 6, 7, 9, 10, 11, 15].reduce((mask, bit) => mask | (1 << bit), 0);
+const smoothedArtifactMask = displayFlagMask & ~badPixelMask;
+
 function displayedFlagsAt(pixel, epochs = displayedEpochs()) {
-  return epochs.reduce((bits, a) => bits | state.decoded.flags[a.idx * state.decoded.grid ** 2 + pixel], 0) & displayFlagMask;
+  const { grid, flags, frames, nDet } = state.decoded;
+  const size = grid * grid;
+  let bits = epochs.reduce((acc, a) => acc | flags[a.idx * size + pixel], 0) & displayFlagMask;
+  if ((state.detector === "fft2d" || state.mode === "fft2d") && frames && grid > 1) {
+    const x = pixel % grid, y = Math.floor(pixel / grid);
+    const detCount = nDet || 6;
+    for (const a of epochs) {
+      let centerValid = false;
+      for (let d = 0; d < detCount; d++) {
+        if (Number.isFinite(frames[(a.idx * detCount + d) * size + pixel])) { centerValid = true; break; }
+      }
+      if (!centerValid) continue;
+      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+        const nx = x + dx, ny = y + dy;
+        if (nx < 0 || ny < 0 || nx >= grid || ny >= grid) continue;
+        const np = ny * grid + nx;
+        let neighborValid = false;
+        for (let d = 0; d < detCount; d++) {
+          if (Number.isFinite(frames[(a.idx * detCount + d) * size + np])) { neighborValid = true; break; }
+        }
+        if (neighborValid) bits |= flags[a.idx * size + np] & smoothedArtifactMask;
+      }
+    }
+  }
+  return bits;
+}
+
+function flagSummaryAt(pixel, epochs = displayedEpochs()) {
+  const bits = displayedFlagsAt(pixel, epochs);
+  if (!bits) return null;
+  const defs = (state.config?.flags_bitmask || []).filter(f => bits & (1 << f.bit));
+  const rank = { high: 3, warn: 2, info: 1 };
+  const top = defs.slice().sort((a, b) => (rank[b.severity] || 0) - (rank[a.severity] || 0))[0];
+  const size = state.decoded.grid * state.decoded.grid;
+  const rgbLabels = { 5: "R(D5)", 3: "G(D3)", 1: "B(D1)" };
+  const channels = [];
+  for (const a of epochs) {
+    const raw = state.decoded.flags[a.idx * size + pixel] & displayFlagMask;
+    if (raw) {
+      const det = a.ep.detectors?.[0];
+      const tag = state.detector === "rgb" && rgbLabels[det] ? rgbLabels[det] : det ? `D${det}` : "";
+      if (tag && !channels.includes(tag)) channels.push(tag);
+    }
+  }
+  return {
+    bits,
+    color: top?.color || "#f59e0b",
+    labels: defs.map(d => d.label),
+    channels
+  };
 }
 
 function skyToPixel(ra, dec) {
@@ -599,13 +667,18 @@ function catalogPosition(source, year) {
     const z = Math.sin(dec) + north * Math.cos(dec);
     lon = Math.atan2(y, x) / rad; lat = Math.atan2(z, Math.hypot(x, y)) / rad;
   }
-  return { ...source, ...skyToPixel(lon, lat), reference: skyToPixel(source.ra, source.dec), propagated };
+  const offsetArcsec = propagated
+    ? Math.hypot(source.gaia.pmra, source.gaia.pmdec) * Math.abs(year - source.reference_epoch) / 1000
+    : 0;
+  return { ...source, ...skyToPixel(lon, lat), reference: skyToPixel(source.ra, source.dec), propagated, offsetArcsec };
 }
 
 function overlaySources() {
   const epochs = displayedEpochs();
-  const mjds = epochs.map(a => a.ep.mjd);
-  const year = mjds.length ? 2000 + ((Math.min(...mjds) + Math.max(...mjds)) / 2 - 51544.5) / 365.25 : null;
+  const mjds = epochs.map(a => a.ep.mjd).filter(Number.isFinite);
+  const fallbackYear = Number.isFinite(state.winStart) && Number.isFinite(state.winEnd) && state.winEnd > 0
+    ? 0.5 * (state.winStart + state.winEnd) : null;
+  const year = mjds.length ? 2000 + ((Math.min(...mjds) + Math.max(...mjds)) / 2 - 51544.5) / 365.25 : fallbackYear;
   return {
     year, sources: (state.sky.sources || [])
       .filter(s => (state.showGaia && s.gaia) || (state.showWise && s.wise))
@@ -621,10 +694,13 @@ function renderSkyOverlay() {
 
   const { sources, year } = overlaySources();
   const labels = [];
-  const singleFrame = displayedEpochs().length === 1;
+  const epochs = displayedEpochs();
+  const singleFrame = epochs.length === 1;
   if (state.showGaia) labels.push(`Gaia circles: PM estimate at ${singleFrame ? "frame" : "time-span midpoint"} ${year?.toFixed(2) || "reference epoch"}; missing PM stays at reference`);
-  if (state.showWise) labels.push("WISE diamonds: catalog positions (not motion-corrected)");
-  if (state.showFlags) labels.push(singleFrame ? "Squares: frame quality flags" : "Squares: union of contributing quality flags");
+  if (state.showWise) labels.push("WISE diamonds: catalog positions (W1 3.4 µm / W2 4.6 µm; not motion-corrected)");
+  if (state.showFlags) labels.push(state.detector === "fft2d"
+    ? "Squares: 3×3 smoothed-neighborhood quality flags"
+    : singleFrame ? "Squares: frame quality flags" : "Squares: union of contributing quality flags");
   const selected = sources.find(s => s.id === state.selectedSource?.id);
   if (selected) labels.push(`${selected.kind}: ${selected.name}${selected.propagated ? " · approximate PM-only position" : " · reference position"}`);
   document.getElementById("overlay-status").textContent = labels.join(" · ");
@@ -638,9 +714,19 @@ function renderSkyOverlay() {
       .attr("d", "M 0 -.65 L .65 0 L 0 .65 L -.65 0 Z")
       .attr("transform", (d) => `translate(${d.px},${d.py})`)
       .attr("fill", "none")
-      .attr("stroke", "#f59e0b")
+      .attr("stroke", (d) => {
+        const w1 = d.wise?.w1mpro, w2 = d.wise?.w2mpro;
+        return Number.isFinite(w1) && Number.isFinite(w2) && (w1 - w2) >= 0.5 ? "#fb923c" : "#f59e0b";
+      })
       .attr("stroke-width", 0.12)
-      .attr("opacity", 0.85);
+      .attr("opacity", 0.85)
+      .append("title").text(d => {
+        const w1 = d.wise?.w1mpro, w2 = d.wise?.w2mpro;
+        const w1Text = Number.isFinite(w1) ? `W1=${w1.toFixed(2)}` : "W1=n/a";
+        const w2Text = Number.isFinite(w2) ? `W2=${w2.toFixed(2)}` : "W2=n/a";
+        const colorText = Number.isFinite(w1) && Number.isFinite(w2) ? ` · W1-W2=${(w1 - w2).toFixed(2)} mag` : "";
+        return `AllWISE ${d.name} · ${w1Text} · ${w2Text}${colorText}`;
+      });
   }
 
   if (state.showGaia) {
@@ -656,7 +742,13 @@ function renderSkyOverlay() {
       .attr("r", 0.5)
       .attr("fill", "none")
       .attr("stroke", "#34d399")
-      .attr("stroke-width", 0.12);
+      .attr("stroke-width", 0.12)
+      .append("title").text(d => {
+        const gMag = d.gaia?.phot_g_mean_mag;
+        const gText = Number.isFinite(gMag) ? `G=${gMag.toFixed(2)}` : "G=n/a";
+        const pmText = d.propagated ? `PM=(${d.gaia.pmra.toFixed(1)}, ${d.gaia.pmdec.toFixed(1)}) mas/yr · Δ=${d.offsetArcsec.toFixed(2)}″` : "reference position";
+        return `Gaia DR3 ${d.name} · ${gText} · ${pmText}`;
+      });
 
     // connect the catalog reference position to the proper-motion estimate at the displayed date.
     gaiaLayer.selectAll("line")
@@ -672,12 +764,11 @@ function renderSkyOverlay() {
   }
 
   if (state.showFlags && state.decoded.flags.length) {
-    const epochs = displayedEpochs();
     const flagsToShow = [];
     const grid = state.decoded.grid;
     for (let p = 0; p < grid * grid; p++) {
-      const bits = displayedFlagsAt(p, epochs);
-      if (bits) flagsToShow.push({ x: p % grid + .5, y: Math.floor(p / grid) + .5, bits });
+      const summary = flagSummaryAt(p, epochs);
+      if (summary) flagsToShow.push({ x: p % grid + .5, y: Math.floor(p / grid) + .5, ...summary });
     }
     const flagLayer = svg.append("g").attr("class", "flags-layer");
 
@@ -689,9 +780,13 @@ function renderSkyOverlay() {
       .attr("width", 1)
       .attr("height", 1)
       .attr("fill", "none")
-      .attr("stroke", "#f59e0b")
+      .attr("stroke", (d) => d.color)
       .attr("stroke-width", 0.08)
-      .append("title").text(d => `Archive pixel flags: 0x${d.bits.toString(16)}`);
+      .append("title").text(d => {
+        const names = d.labels.length ? d.labels.join(", ") : `0x${d.bits.toString(16)}`;
+        const ch = d.channels.length ? ` · ${d.channels.join("/")}` : "";
+        return `Archive pixel flags: ${names} (0x${d.bits.toString(16)})${ch}`;
+      });
   }
 
   if (selected) {
@@ -705,18 +800,84 @@ function renderSkyOverlay() {
   }
 }
 
-function fieldMeasurements() {
+function fieldMeasurements(entries = null) {
   const { grid, frames, wavelengths, nDet } = state.decoded;
   const size = grid * grid;
-  return state.sky.epochs.flatMap((ep, i) => {
+  const list = entries || state.sky.epochs.map((ep, idx) => ({ idx, ep }));
+  return list.flatMap(({ idx, ep }) => {
     const detector = ep.detectors[0] - 1;
     let sum = 0, wave = 0, count = 0;
     for (let p = 0; p < size; p++) {
-      const v = frames[(i * nDet + detector) * size + p], w = wavelengths[i * size + p];
+      const v = frames[(idx * nDet + detector) * size + p], w = wavelengths[idx * size + p];
       if (Number.isFinite(v) && Number.isFinite(w)) { sum += v; wave += w; count++; }
     }
     return count ? [{ brightness: sum / count, wavelength_um: wave / count, detector, mjd: ep.mjd }] : [];
   }).sort((a, b) => a.wavelength_um - b.wavelength_um);
+}
+
+function apertureMeasurements(pixel, entries = null) {
+  const { grid, frames, wavelengths, nDet } = state.decoded;
+  const size = grid * grid;
+  const list = entries || state.sky.epochs.map((ep, idx) => ({ idx, ep }));
+  const radii = [0, 1.5, 3, 5, 8, 12];
+  return list.flatMap(({ idx, ep }) => {
+    const detector = ep.detectors[0] - 1;
+    const frameBase = (idx * nDet + detector) * size;
+    const waveBase = idx * size;
+    for (const r of radii) {
+      let sumB = 0, sumW = 0, count = 0;
+      const span = Math.ceil(r);
+      for (let dy = -span; dy <= span; dy++) for (let dx = -span; dx <= span; dx++) {
+        if (Math.hypot(dx, dy) > r + 1e-6) continue;
+        const nx = pixel.x + dx, ny = pixel.y + dy;
+        if (nx < 0 || ny < 0 || nx >= grid || ny >= grid) continue;
+        const p = ny * grid + nx;
+        const b = frames[frameBase + p], w = wavelengths[waveBase + p];
+        if (Number.isFinite(b) && Number.isFinite(w) && w > 0) { sumB += b; sumW += w; count++; }
+      }
+      if (count) return [{ brightness: sumB / count, wavelength_um: sumW / count, detector, mjd: ep.mjd, aperture_px: r }];
+    }
+    return [];
+  }).sort((a, b) => a.wavelength_um - b.wavelength_um);
+}
+
+function lvfCutoutMeasurements(entries = null, pixel = null, bins = 16) {
+  if (!state.decoded?.wavelengths?.length || !state.decoded?.frames?.length) return [];
+  const { grid, frames, wavelengths, nDet } = state.decoded;
+  const size = grid * grid;
+  const list = entries || state.sky.epochs.map((ep, idx) => ({ idx, ep }));
+  const cx = pixel ? pixel.x : grid / 2, cy = pixel ? pixel.y : grid / 2;
+  const pairs = [];
+  for (const { idx, ep } of list) {
+    const detector = ep.detectors[0] - 1;
+    if (detector < 0) continue;
+    const frameBase = (idx * nDet + detector) * size;
+    const waveBase = idx * size;
+    for (let p = 0; p < size; p++) {
+      const b = frames[frameBase + p], w = wavelengths[waveBase + p];
+      if (!Number.isFinite(b) || !Number.isFinite(w) || w <= 0) continue;
+      const dist = Math.hypot((p % grid) - cx, Math.floor(p / grid) - cy);
+      pairs.push({ wavelength_um: w, brightness: b, detector, mjd: ep.mjd, dist });
+    }
+  }
+  if (pairs.length < 4) return [];
+  const local = pairs.filter(p => p.dist <= 16);
+  const pool = local.length >= 16 ? local : pairs;
+  pool.sort((a, b) => a.wavelength_um - b.wavelength_um);
+  const wMin = pool[0].wavelength_um, wMax = pool[pool.length - 1].wavelength_um;
+  if (!(wMax > wMin)) return [];
+  const out = [];
+  for (let i = 0; i < bins; i++) {
+    const lo = wMin + (wMax - wMin) * (i / bins);
+    const hi = wMin + (wMax - wMin) * ((i + 1) / bins);
+    const slice = pool.filter(p => p.wavelength_um >= lo && (i === bins - 1 ? p.wavelength_um <= hi : p.wavelength_um < hi));
+    if (slice.length) {
+      const meanB = slice.reduce((s, p) => s + p.brightness, 0) / slice.length;
+      const meanW = slice.reduce((s, p) => s + p.wavelength_um, 0) / slice.length;
+      out.push({ wavelength_um: meanW, brightness: meanB, detector: slice[0].detector, mjd: slice[0].mjd });
+    }
+  }
+  return out;
 }
 
 function spectralAnalysis(samples) {
@@ -738,6 +899,79 @@ function spectralAnalysis(samples) {
   };
 }
 
+function resampleSpectralSeries(samples, gridCount = 32) {
+  const valid = (samples || [])
+    .filter(s => Number.isFinite(s.wavelength_um) && Number.isFinite(s.brightness) && s.wavelength_um > 0)
+    .slice()
+    .sort((a, b) => a.wavelength_um - b.wavelength_um);
+  if (valid.length < 2) return [];
+  const merged = [];
+  for (const item of valid) {
+    const prev = merged[merged.length - 1];
+    if (prev && Math.abs(item.wavelength_um - prev.wavelength_um) < 1e-4) {
+      prev.wavelength_um = 0.5 * (prev.wavelength_um + item.wavelength_um);
+      prev.brightness = 0.5 * (prev.brightness + item.brightness);
+    } else {
+      merged.push({ wavelength_um: item.wavelength_um, brightness: item.brightness });
+    }
+  }
+  if (merged.length < 2) return [];
+  const wMin = merged[0].wavelength_um, wMax = merged[merged.length - 1].wavelength_um;
+  if (!(wMax > wMin)) return [];
+  const step = (wMax - wMin) / (gridCount - 1);
+  return Array.from({ length: gridCount }, (_, i) => {
+    const w = wMin + i * step;
+    let idx = 0;
+    while (idx < merged.length - 2 && merged[idx + 1].wavelength_um < w) idx++;
+    const a = merged[idx], b = merged[idx + 1];
+    const t = b.wavelength_um > a.wavelength_um ? Math.max(0, Math.min(1, (w - a.wavelength_um) / (b.wavelength_um - a.wavelength_um))) : 0;
+    return { wavelength_um: w, brightness: a.brightness + t * (b.brightness - a.brightness) };
+  });
+}
+
+function interpolateOnGrid(gridW, gridValues, targetW) {
+  if (!gridW.length) return 0;
+  if (targetW <= gridW[0]) return gridValues[0];
+  if (targetW >= gridW[gridW.length - 1]) return gridValues[gridValues.length - 1];
+  const step = gridW[1] - gridW[0];
+  const pos = (targetW - gridW[0]) / step;
+  const idx = Math.max(0, Math.min(gridW.length - 2, Math.floor(pos)));
+  const frac = pos - idx;
+  return gridValues[idx] + frac * (gridValues[idx + 1] - gridValues[idx]);
+}
+
+function observationSpectrum(measurements, activeEntries = null) {
+  const direct = spectralAnalysis(measurements);
+  if (direct.fft_amplitude?.length) return direct;
+  let basis = measurements;
+  const uniqueWaves = new Set(measurements.map(m => m.wavelength_um.toFixed(4)));
+  if (uniqueWaves.size < 4) {
+    const lvf = lvfCutoutMeasurements(activeEntries, state.spectrumPixel);
+    if (lvf.length >= 4) basis = lvf;
+  }
+  const gridSamples = resampleSpectralSeries(basis, 32);
+  if (gridSamples.length < 4) return {};
+  const gridded = spectralAnalysis(gridSamples);
+  if (!gridded.fft_amplitude?.length) return {};
+  const gridW = gridSamples.map(s => s.wavelength_um);
+  const projectedBands = {};
+  for (const name of ["low", "mid", "high"]) {
+    projectedBands[name] = measurements.map(m => interpolateOnGrid(gridW, gridded.fft_bands[name], m.wavelength_um));
+  }
+  for (let i = 0; i < measurements.length; i++) {
+    const knotResidual = measurements[i].brightness - (projectedBands.low[i] + projectedBands.mid[i] + projectedBands.high[i]);
+    if (Number.isFinite(knotResidual)) projectedBands.high[i] += knotResidual;
+  }
+  return {
+    fft_amplitude: gridded.fft_amplitude,
+    fft_period_um: gridded.fft_period_um,
+    fft_bands: projectedBands,
+    grid_wavelengths: gridW,
+    grid_bands: gridded.fft_bands,
+    gridded: true
+  };
+}
+
 function demoSpectralSamples() {
   return Array.from({ length: 48 }, (_, i) => ({
     wavelength_um: .9 + i * .08, detector: 0, demo: true,
@@ -747,24 +981,37 @@ function demoSpectralSamples() {
 
 function renderSpectralCharts() {
   if (!state.sky) return;
-  let measurements = state.sky.measurements || [];
+  const active = getActiveEpochs();
+  const activeDetectors = state.detector.startsWith("D")
+    ? new Set([Number(state.detector.slice(1)) - 1])
+    : state.detector === "rgb" && [1, 3, 5].every(d => active.some(a => a.ep.detectors.includes(d)))
+      ? new Set([0, 2, 4])
+      : null;
+  const margin = epochWindowMargin();
+  const minMjd = active.length ? Math.min(...active.map(a => a.ep.mjd)) - 0.5 : -Infinity;
+  const maxMjd = active.length ? Math.max(...active.map(a => a.ep.mjd)) + 0.5 : Infinity;
+  let measurements = (state.sky.measurements || []).filter(m => {
+    const inDet = !activeDetectors || activeDetectors.has(m.detector);
+    const mYear = 2000 + (m.mjd - 51544.5) / 365.25;
+    const inTime = (m.mjd >= minMjd && m.mjd <= maxMjd) || (mYear >= state.winStart - margin && mYear <= state.winEnd + margin);
+    return inDet && inTime;
+  });
+  let apertureRadius = Math.max(0, ...measurements.map(m => m.aperture_px || 0));
   if (state.spectrumPixel) {
-    const { grid, frames, wavelengths, nDet } = state.decoded;
-    const pixel = state.spectrumPixel.y * grid + state.spectrumPixel.x;
-    measurements = state.sky.epochs.flatMap((epoch, index) => {
-      const detector = epoch.detectors[0] - 1;
-      const brightness = frames[(index * nDet + detector) * grid * grid + pixel];
-      const wavelength = wavelengths[index * grid * grid + pixel];
-      return Number.isFinite(brightness) && Number.isFinite(wavelength)
-        ? [{ brightness, wavelength_um: wavelength, detector, mjd: epoch.mjd }] : [];
-    }).sort((a, b) => a.wavelength_um - b.wavelength_um);
+    measurements = apertureMeasurements(state.spectrumPixel, active);
+    apertureRadius = Math.max(0, ...measurements.map(m => m.aperture_px || 0));
   }
   let fieldFallback = false;
-  if (!measurements.length) {
+  if (!measurements.length && active.length) {
     fieldFallback = true;
-    measurements = fieldMeasurements();
+    measurements = fieldMeasurements(active);
   }
-  document.getElementById("sed-title").textContent = `${fieldFallback ? "Field mean (pixel unavailable)" : state.spectrumPixel ? "Selected-pixel" : "Center-pixel"} brightness · MJy/sr`;
+  const sourceLabel = fieldFallback
+    ? "Field mean (pixel unavailable)"
+    : state.spectrumPixel
+      ? (apertureRadius > 0 ? `Selected-aperture (r=${apertureRadius}px)` : "Selected-pixel")
+      : (apertureRadius > 0 ? `Center PSF-aperture (r=${apertureRadius}px)` : "Center-pixel");
+  document.getElementById("sed-title").textContent = `${sourceLabel} brightness · MJy/sr`;
   document.getElementById("sed-subtitle").textContent = `${measurements.length} observations \u00b7 different dates`;
   if (state.fftDemo) {
     measurements = demoSpectralSamples();
@@ -773,13 +1020,13 @@ function renderSpectralCharts() {
   }
   document.getElementById("btn-fft-demo").classList.toggle("active", state.fftDemo);
   document.getElementById("btn-fft-demo").setAttribute("aria-pressed", String(state.fftDemo));
-  const spectrum = fieldFallback && !state.fftDemo ? {} : spectralAnalysis(measurements);
-  const filtered = spectrum.fft_bands?.[state.fftFilter];
-  renderSedSvg(filtered ? measurements.map((m, i) => ({ ...m, brightness: filtered[i] })) : measurements);
+  const spectrum = state.fftDemo ? spectralAnalysis(measurements) : observationSpectrum(measurements, active);
+  const filtered = state.fftFilter !== "raw" ? spectrum.fft_bands?.[state.fftFilter] : null;
+  renderSedSvg(filtered ? measurements.map((m, i) => ({ ...m, brightness: filtered[i] })) : measurements, spectrum);
   renderFftSvg({ ...spectrum, measurements });
 }
 
-function renderSedSvg(measurements) {
+function renderSedSvg(measurements, spectrum = {}) {
   const element = document.getElementById("sed-svg");
   const width = element.clientWidth || 440, height = element.clientHeight || 120;
   const svg = d3.select(element); svg.selectAll("*").remove();
@@ -792,9 +1039,19 @@ function renderSedSvg(measurements) {
   const y = d3.scaleLinear().domain([min, max]).nice().range([h, 0]);
   group.append("g").attr("class", "axis").attr("transform", `translate(0,${h})`).call(d3.axisBottom(x).ticks(6).tickFormat(v => `${v} \u00b5m`));
   group.append("g").attr("class", "axis").call(d3.axisLeft(y).ticks(4));
+  if (measurements.length >= 2) {
+    const lineGen = d3.line().x(d => x(d.wavelength_um)).y(d => y(d.brightness));
+    group.append("path")
+      .datum(measurements)
+      .attr("class", "sed-curve")
+      .attr("fill", "none")
+      .attr("stroke", state.fftFilter === "raw" ? "rgba(148,163,184,0.45)" : "#38bdf8")
+      .attr("stroke-width", state.fftFilter === "raw" ? 1.1 : 1.5)
+      .attr("d", lineGen);
+  }
   group.selectAll("circle").data(measurements).join("circle")
     .attr("cx", m => x(m.wavelength_um)).attr("cy", m => y(m.brightness)).attr("r", 3)
-    .attr("fill", m => state.sky.detectors[m.detector].color)
+    .attr("fill", m => state.sky.detectors[m.detector]?.color || "#38bdf8")
     .append("title").text(m => m.demo ? `Synthetic: ${m.wavelength_um.toFixed(4)} µm · ${m.brightness.toPrecision(5)} arbitrary units`
       : `${m.wavelength_um.toFixed(4)} \u00b5m \u00b7 ${m.brightness.toPrecision(5)} MJy/sr \u00b7 MJD ${m.mjd.toFixed(3)}`);
   if (!measurements.length) group.append("text").attr("x", 4).attr("y", 16).attr("fill", "#94a3b8").text("No valid measurements at this pixel (masked or missing)");
@@ -808,31 +1065,55 @@ function renderFftSvg(source) {
   const element = document.getElementById("fft-svg");
   const svg = d3.select(element); svg.selectAll("*").remove();
   const amplitudes = source.fft_amplitude || [];
-  document.getElementById("fft-subtitle").textContent = amplitudes.length ? `${state.fftDemo ? "Synthetic demo · " : ""}|FFT| · period in wavelength space` : "Uniform wavelength sampling required";
+  const counts = Array.from({ length: 6 }, (_, d) => (source.measurements || []).filter(m => m.detector === d).length);
+  document.getElementById("fft-subtitle").textContent = amplitudes.length
+    ? `${state.fftDemo ? "Synthetic demo · " : source.gridded ? "Gridded LVF spectrum · " : ""}|FFT| · period in wavelength space`
+    : "Uniform wavelength sampling required";
   if (!amplitudes.length) state.fftFilter = "raw";
   document.querySelectorAll("#fft-buttons .chip[data-fft]").forEach(button => {
     button.disabled = button.dataset.fft !== "raw" && !amplitudes.length;
     button.classList.toggle("active", button.dataset.fft === state.fftFilter);
-    button.title = button.disabled ? "Requires at least four evenly spaced measured wavelengths" : "Filter the sampled spectrum";
+    button.title = button.disabled ? "Requires valid spectral observations" : "Filter the sampled spectrum";
   });
+  const width = (element.clientWidth || 300) - 24;
   if (!amplitudes.length) {
-    svg.append("text").attr("x", 12).attr("y", 28).attr("fill", "#94a3b8").text("No FFT for sparse, unequal-wavelength samples.");
-    const counts = Array.from({ length: 6 }, (_, d) => (source.measurements || []).filter(m => m.detector === d).length);
-    const width = (element.clientWidth || 300) - 24;
+    svg.append("text").attr("x", 12).attr("y", 28).attr("fill", "#94a3b8").text("No FFT for empty observation set.");
     svg.selectAll("rect.coverage").data(counts).join("rect").attr("class", "coverage")
       .attr("x", (_, i) => 12 + i * width / 6).attr("y", 65).attr("width", width / 6 - 5)
-      .attr("height", v => v * 5).attr("fill", (_, i) => state.sky.detectors[i].color);
+      .attr("height", v => v * 5).attr("fill", (_, i) => state.sky.detectors[i]?.color || "#38bdf8");
     svg.selectAll("text.coverage").data(counts).join("text").attr("class", "coverage")
       .attr("x", (_, i) => 12 + i * width / 6).attr("y", 55).attr("fill", "#94a3b8").text((v, i) => `D${i + 1}: ${v}`);
-    document.getElementById("fft-subtitle").textContent = "Observed coverage; FFT requires uniform samples";
+    document.getElementById("fft-subtitle").textContent = "No valid observations in current selection";
     return;
   }
   const w = (element.clientWidth || 300) - 52, h = (element.clientHeight || 120) - 36;
   const group = svg.append("g").attr("transform", "translate(40,8)");
   const x = d3.scaleBand().domain(d3.range(amplitudes.length)).range([0, w]).padding(.15);
   const y = d3.scaleLinear().domain([0, d3.max(amplitudes) || 1]).range([h, 0]);
-  group.selectAll("rect").data(amplitudes).join("rect").attr("x", (_, i) => x(i)).attr("y", y)
-    .attr("width", x.bandwidth()).attr("height", v => h - y(v)).attr("fill", "#38bdf8");
+  const limit = Math.max(1, amplitudes.length - 1);
+  group.selectAll("rect").data(amplitudes).join("rect")
+    .attr("class", "fft-bar")
+    .attr("x", (_, i) => x(i)).attr("y", y)
+    .attr("width", x.bandwidth()).attr("height", v => h - y(v))
+    .attr("fill", (_, i) => {
+      const frac = i / limit;
+      if (state.fftFilter === "low") return frac <= 1 / 3 ? "#38bdf8" : "rgba(56,189,248,0.22)";
+      if (state.fftFilter === "mid") return frac > 1 / 3 && frac <= 2 / 3 ? "#38bdf8" : "rgba(56,189,248,0.22)";
+      if (state.fftFilter === "high") return frac > 2 / 3 ? "#38bdf8" : "rgba(56,189,248,0.22)";
+      return "#38bdf8";
+    })
+    .append("title").text((v, i) => `Mode ${i} (${formatSpectralPeriod(source.fft_period_um[i])}): |FFT| = ${v.toPrecision(4)}`);
+  if (amplitudes.length >= 2) {
+    const envLine = d3.line().x((_, i) => (x(i) ?? 0) + x.bandwidth() / 2).y(v => y(v));
+    group.append("path")
+      .datum(amplitudes)
+      .attr("class", "fft-envelope")
+      .attr("fill", "none")
+      .attr("stroke", "#7dd3fc")
+      .attr("stroke-width", 1)
+      .attr("opacity", 0.7)
+      .attr("d", envLine);
+  }
   const ticks = [0, ...d3.range(1, amplitudes.length).filter(i => i % Math.max(1, Math.floor(amplitudes.length / 4)) === 0)];
   group.append("g").attr("class", "axis").attr("transform", `translate(0,${h})`)
     .call(d3.axisBottom(x).tickValues(ticks).tickFormat(i => formatSpectralPeriod(source.fft_period_um[i])));
@@ -885,10 +1166,11 @@ function renderTimelineBrush() {
       const y1 = x.invert(x1);
       state.winStart = Math.min(y0, y1);
       state.winEnd = Math.max(y0, y1);
-      const span = Math.max(0.1, state.winEnd - state.winStart);
-      document.getElementById("time-subtitle").textContent = `${span.toFixed(1)} yr (${state.winStart.toFixed(1)}–${state.winEnd.toFixed(1)})`;
+      const span = Math.max(0.01, state.winEnd - state.winStart);
+      document.getElementById("time-subtitle").textContent = `${span.toFixed(2)} yr (${state.winStart.toFixed(2)}–${state.winEnd.toFixed(2)})`;
       renderEpochLegend();
       renderCurrentFrame();
+      renderSpectralCharts();
     });
 
   const brushG = g.append("g").attr("class", "brush").call(brush);
@@ -1190,12 +1472,39 @@ function bindEvents() {
     const { ra: cursorRa, dec: cursorDec } = pixelToSky(px, py);
 
     const pixel = Math.floor(py) * state.decoded.grid + Math.floor(px);
-    const flags = displayedFlagsAt(pixel);
+    const summary = state.showFlags ? flagSummaryAt(pixel) : null;
+    let hoveredSource = null;
+    if (state.showGaia || state.showWise) {
+      let bestD2 = 2.25;
+      for (const src of overlaySources().sources) {
+        const d2 = (src.px - px) ** 2 + (src.py - py) ** 2;
+        if (d2 < bestD2) { bestD2 = d2; hoveredSource = src; }
+      }
+    }
     const tip = document.getElementById("flag-tooltip");
-    if (flags && state.showFlags) {
+    const tipParts = [];
+    if (summary) {
+      const ch = summary.channels.length ? ` [${summary.channels.join("/")}]` : "";
+      tipParts.push(`Quality flags${ch}: ${summary.labels.join(", ") || "flagged pixel"} (0x${summary.bits.toString(16)})`);
+    }
+    if (hoveredSource) {
+      if (hoveredSource.gaia) {
+        const gMag = hoveredSource.gaia.phot_g_mean_mag;
+        const gStr = Number.isFinite(gMag) ? `G=${gMag.toFixed(2)}` : "G=n/a";
+        const pmStr = hoveredSource.propagated
+          ? `PM=(${hoveredSource.gaia.pmra.toFixed(1)}, ${hoveredSource.gaia.pmdec.toFixed(1)}) mas/yr`
+          : "reference epoch";
+        tipParts.push(`Gaia DR3 ${hoveredSource.name} · ${gStr} · ${pmStr}`);
+      } else if (hoveredSource.wise) {
+        const w1 = hoveredSource.wise.w1mpro, w2 = hoveredSource.wise.w2mpro;
+        const w1Str = Number.isFinite(w1) ? `W1=${w1.toFixed(2)}` : "W1=n/a";
+        const w2Str = Number.isFinite(w2) ? `W2=${w2.toFixed(2)}` : "W2=n/a";
+        tipParts.push(`AllWISE ${hoveredSource.name} · ${w1Str} · ${w2Str}`);
+      }
+    }
+    if (tipParts.length) {
       const stageRect = stage.getBoundingClientRect();
-      const names = (state.config.flags_bitmask || []).filter(f => flags & (1 << f.bit)).map(f => f.label);
-      tip.textContent = `Quality flags: ${names.join(", ") || "flagged pixel"} (0x${flags.toString(16)})`;
+      tip.textContent = tipParts.join(" · ");
       tip.style.left = `${ev.clientX - stageRect.left + 12}px`;
       tip.style.top = `${ev.clientY - stageRect.top - 12}px`;
       tip.classList.remove("hidden");

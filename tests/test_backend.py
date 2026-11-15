@@ -13,7 +13,7 @@ from astropy.io import fits
 from astropy.wcs import WCS
 from astropy.time import Time
 
-from archive import Archive, ArchiveError, DiskCache, compute_spectral_fft, covers_center, display_wcs, empty_sky, encoded, read_votable
+from archive import Archive, ArchiveError, DiskCache, aperture_sample, compute_spectral_fft, covers_center, display_wcs, empty_sky, encoded, propagate_gaia_radec, read_votable, resample_spectral_grid
 from server import SkyEngine, cached_preview, load_config, normalize_query
 
 
@@ -43,6 +43,47 @@ class SpectrumTests(unittest.TestCase):
                                      ([1, 2, 3, 4], [1, np.nan, 2, 3])]:
             with self.assertRaises(ValueError):
                 compute_spectral_fft(spectrum, wavelength)
+
+    def test_resamples_nonuniform_measurements_and_recovers_saturated_psf_ring(self):
+        measurements = [
+            {"wavelength_um": 0.758, "brightness": 18.4},
+            {"wavelength_um": 1.124, "brightness": 24.1},
+            {"wavelength_um": 1.682, "brightness": 31.7},
+            {"wavelength_um": 2.415, "brightness": 21.9},
+            {"wavelength_um": 3.812, "brightness": 12.6},
+            {"wavelength_um": 4.871, "brightness": 8.2},
+        ]
+        fft = resample_spectral_grid(measurements, 32)
+        self.assertIsNotNone(fft)
+        self.assertEqual(len(fft["grid_wavelength_um"]), 32)
+        self.assertEqual(len(fft["fft_amplitude"]), 17)
+        reconstructed = (
+            np.asarray(fft["fft_bands"]["low"])
+            + np.asarray(fft["fft_bands"]["mid"])
+            + np.asarray(fft["fft_bands"]["high"])
+        )
+        np.testing.assert_allclose(reconstructed, fft["grid_brightness"], atol=1e-12)
+
+        plane = np.full((64, 64), 10.0, dtype=np.float32)
+        plane[31:34, 31:34] = np.nan
+        wave = np.full((64, 64), 2.5, dtype=np.float32)
+        band = np.full((64, 64), 0.1, dtype=np.float32)
+        wave_um, band_um, brightness, aperture_px = aperture_sample(plane, wave, band)
+        self.assertIsNotNone(brightness)
+        self.assertAlmostEqual(brightness, 10.0, places=5)
+        self.assertAlmostEqual(wave_um, 2.5, places=5)
+        self.assertAlmostEqual(band_um, 0.1, places=5)
+        self.assertGreater(aperture_px, 0.0)
+
+    def test_propagates_high_proper_motion_gaia_source_into_small_fov(self):
+        ra_2016, dec_2016 = 269.452077, 4.693365
+        ra_2026, dec_2026 = propagate_gaia_radec(ra_2016, dec_2016, -801.55, 10362.39, 2016.0, 2026.0)
+        wcs = display_wcs(ra_2026, dec_2026, 150.0)
+        px_2016, py_2016 = wcs.world_to_pixel_values(ra_2016, dec_2016)
+        px_2026, py_2026 = wcs.world_to_pixel_values(ra_2026, dec_2026)
+        self.assertGreater(float(py_2016), 64.0)
+        self.assertAlmostEqual(float(px_2026), 31.5, delta=1.0)
+        self.assertAlmostEqual(float(py_2026), 31.5, delta=1.0)
 
 
 class ArchiveTests(unittest.TestCase):

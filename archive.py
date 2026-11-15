@@ -133,6 +133,65 @@ def compute_spectral_fft(spectrum, wavelengths_um):
     }
 
 
+def resample_spectral_grid(measurements, grid_size=32):
+    valid = sorted(
+        (float(m["wavelength_um"]), float(m["brightness"]))
+        for m in (measurements or [])
+        if m.get("wavelength_um") is not None and m.get("brightness") is not None
+        and math.isfinite(m["wavelength_um"]) and math.isfinite(m["brightness"]) and m["wavelength_um"] > 0
+    )
+    if len(valid) < 2:
+        return None
+    merged_w, merged_b = [], []
+    for w, b in valid:
+        if merged_w and abs(w - merged_w[-1]) < 1e-4:
+            merged_w[-1] = 0.5 * (merged_w[-1] + w)
+            merged_b[-1] = 0.5 * (merged_b[-1] + b)
+        else:
+            merged_w.append(w)
+            merged_b.append(b)
+    if len(merged_w) < 2 or merged_w[-1] <= merged_w[0]:
+        return None
+    grid_w = np.linspace(merged_w[0], merged_w[-1], max(4, int(grid_size)), dtype=float)
+    grid_b = np.interp(grid_w, np.asarray(merged_w, dtype=float), np.asarray(merged_b, dtype=float))
+    result = compute_spectral_fft(grid_b, grid_w)
+    result["grid_wavelength_um"] = grid_w.tolist()
+    result["grid_brightness"] = grid_b.tolist()
+    return result
+
+
+def aperture_sample(plane, wave_plane, band_plane):
+    center = (GRID_SIZE - 1) / 2.0
+    yy, xx = np.mgrid[:GRID_SIZE, :GRID_SIZE]
+    dist = np.hypot(xx - center, yy - center)
+    valid = np.isfinite(plane) & np.isfinite(wave_plane) & (wave_plane > 0)
+    for radius in (0.75, 1.5, 3.0, 5.0, 8.0, 12.0, 64.0):
+        mask = valid & (dist <= radius)
+        if np.any(mask):
+            b_vals = band_plane[mask]
+            band_finite = b_vals[np.isfinite(b_vals) & (b_vals > 0)]
+            return (
+                float(np.median(wave_plane[mask])),
+                float(np.median(band_finite)) if band_finite.size else 0.02,
+                float(np.median(plane[mask])),
+                float(radius),
+            )
+    return None, None, None, None
+
+
+def propagate_gaia_radec(ra_deg, dec_deg, pmra_mas_yr, pmdec_mas_yr, ref_epoch, target_epoch=2026.5):
+    if any(v is None or not math.isfinite(v) for v in (ra_deg, dec_deg, pmra_mas_yr, pmdec_mas_yr, ref_epoch)):
+        return ra_deg, dec_deg
+    rad = math.pi / 180.0
+    ra, dec = ra_deg * rad, dec_deg * rad
+    scale = (target_epoch - ref_epoch) * rad / 3600000.0
+    east, north = pmra_mas_yr * scale, pmdec_mas_yr * scale
+    x = math.cos(dec) * math.cos(ra) - east * math.sin(ra) - north * math.sin(dec) * math.cos(ra)
+    y = math.cos(dec) * math.sin(ra) + east * math.cos(ra) - north * math.sin(dec) * math.sin(ra)
+    z = math.sin(dec) + north * math.cos(dec)
+    return (math.atan2(y, x) / rad) % 360.0, math.atan2(z, math.hypot(x, y)) / rad
+
+
 def encoded(array, dtype="<f4"):
     return base64.b64encode(np.ascontiguousarray(array, dtype=dtype).tobytes()).decode("ascii")
 
@@ -167,7 +226,7 @@ class Archive:
     def collections(self, force=False):
         with self.discovery_lock:
             cached = self.cache.get("collections")
-            if cached and not force and time.time() - cached[0] < 3600:
+            if cached and not force and time.time() - cached[0] < 86400 * 7:
                 return cached[1]
             try:
                 root = ET.fromstring(self.fetch(SIA_URL, {"MAXREC": 0}))
@@ -199,13 +258,23 @@ class Archive:
                    ("DPTYPE", "image"), ("MAXREC", 10000)]
         search_key = "search:" + hashlib.sha256(json.dumps([ra, dec, window, collections]).encode()).hexdigest()
         cached = self.cache.get(search_key)
-        if cached and time.time() - cached[0] < 3600:
+        if cached is None:
+            alt_key = "search:" + hashlib.sha256(json.dumps([round(float(ra) % 360, 6), round(float(dec), 6), round(float(window), 3), collections]).encode()).hexdigest()
+            cached = self.cache.get(alt_key)
+        if cached and time.time() - cached[0] < 86400 * 7:
             return cached[1], collections
-        rows, overflow = read_votable(self.fetch(SIA_URL, params))
-        if overflow:
-            raise ArchiveError("SIA result exceeded 10,000 images; choose a smaller field or time window")
-        self.cache.put(search_key, rows)
-        return rows, collections
+        try:
+            rows, overflow = read_votable(self.fetch(SIA_URL, params))
+            if overflow:
+                raise ArchiveError("SIA result exceeded 10,000 images; choose a smaller field or time window")
+            self.cache.put(search_key, rows)
+            return rows, collections
+        except ArchiveError:
+            raise
+        except Exception:
+            if cached:
+                return cached[1], collections
+            raise
 
     def cutout(self, row, ra, dec, fov):
         url = row["access_url"]
@@ -283,24 +352,42 @@ class Archive:
                       "selcols": columns, "outrows": 1000}
             key = "catalog:" + hashlib.sha256(json.dumps(params, sort_keys=True).encode()).hexdigest()
             cached = self.cache.get(key)
-            if cached and time.time() - cached[0] < 86400:
-                results[kind] = cached[1]
-                continue
-            try:
-                rows, overflow = read_votable(self.fetch("https://irsa.ipac.caltech.edu/cgi-bin/Gator/nph-query", params))
-                results[kind] = rows
-                self.cache.put(key, rows)
-                if overflow or len(rows) == 1000:
-                    errors[kind] = "Catalog display limited to 1,000 sources"
-            except Exception as exc:
-                results[kind] = cached[1] if cached else []
-                errors[kind] = str(exc)
+            if cached and time.time() - cached[0] < 86400 * 7:
+                rows = list(cached[1])
+            else:
+                try:
+                    rows, overflow = read_votable(self.fetch("https://irsa.ipac.caltech.edu/cgi-bin/Gator/nph-query", params))
+                    self.cache.put(key, rows)
+                    if overflow or len(rows) == 1000:
+                        errors[kind] = "Catalog display limited to 1,000 sources"
+                except Exception as exc:
+                    rows = list(cached[1]) if cached else []
+                    errors[kind] = str(exc)
+            if fov > 300:
+                inner_params = dict(params, radius=300 / math.sqrt(2))
+                inner_key = "catalog:" + hashlib.sha256(json.dumps(inner_params, sort_keys=True).encode()).hexdigest()
+                inner_cached = self.cache.get(inner_key)
+                if inner_cached:
+                    id_field = "source_id" if kind == "gaia" else "designation"
+                    seen = {str(r.get(id_field)) for r in rows}
+                    for inner_row in inner_cached[1]:
+                        if str(inner_row.get(id_field)) not in seen:
+                            rows.append(inner_row)
+                            seen.add(str(inner_row.get(id_field)))
+            results[kind] = rows
         sources = []
         wcs = display_wcs(ra, dec, fov)
         for kind, rows in results.items():
             for row in rows:
                 px, py = wcs.world_to_pixel_values(row["ra"], row["dec"])
-                if not (-1 <= px < GRID_SIZE and -1 <= py < GRID_SIZE):
+                in_box = -1 <= px < GRID_SIZE and -1 <= py < GRID_SIZE
+                if not in_box and kind == "gaia":
+                    prop_ra, prop_dec = propagate_gaia_radec(
+                        row["ra"], row["dec"], row.get("pmra"), row.get("pmdec"), row.get("ref_epoch"), 2026.5
+                    )
+                    ppx, ppy = wcs.world_to_pixel_values(prop_ra, prop_dec)
+                    in_box = -1 <= ppx < GRID_SIZE and -1 <= ppy < GRID_SIZE
+                if not in_box:
                     continue
                 name = str(row.get("source_id", row.get("designation")))
                 sources.append({"id": f"{kind}:{name}", "name": name, "kind": "Gaia DR3" if kind == "gaia" else "AllWISE",
@@ -367,17 +454,27 @@ class Archive:
             wavelength_maps[idx] = np.frombuffer(base64.b64decode(cutout["wavelength_map"]), dtype="<f4").reshape(GRID_SIZE, GRID_SIZE)
             bandwidth_maps[idx] = np.frombuffer(base64.b64decode(cutout["bandwidth_map"]), dtype="<f4").reshape(GRID_SIZE, GRID_SIZE)
             epoch_time = Time(cutout["mjd"], format="mjd")
+            wave_um = cutout["wavelength_um"]
+            band_um = cutout["bandwidth_um"]
+            brightness = cutout["center_brightness"]
+            aperture_px = 0.0
+            if wave_um is None or brightness is None or not math.isfinite(wave_um) or not math.isfinite(brightness):
+                wave_um, band_um, brightness, aperture_px = aperture_sample(
+                    frames[idx, detector], wavelength_maps[idx], bandwidth_maps[idx]
+                )
             epochs.append({"index": idx, "year": float(epoch_time.decimalyear), "mjd": cutout["mjd"],
                            "label": epoch_time.isot[:10] + f" D{detector + 1}",
                            "source": cutout["collection"], "detectors": [detector + 1],
-                           "wavelength_um": cutout["wavelength_um"], "bandwidth_um": cutout["bandwidth_um"]})
-            if cutout["wavelength_um"] is not None and cutout["center_brightness"] is not None:
-                measurements.append({"wavelength_um": cutout["wavelength_um"], "brightness": cutout["center_brightness"],
-                                     "detector": detector, "mjd": cutout["mjd"]})
+                           "wavelength_um": wave_um, "bandwidth_um": band_um})
+            if wave_um is not None and brightness is not None and math.isfinite(wave_um) and math.isfinite(brightness):
+                measurements.append({"wavelength_um": wave_um, "brightness": brightness,
+                                     "detector": detector, "mjd": cutout["mjd"], "aperture_px": aperture_px})
         measurements.sort(key=lambda m: m["wavelength_um"])
+        spectral_fft = resample_spectral_grid(measurements)
         payload.update({"epochs": epochs, "frames_b64": encoded(frames), "flags_b64": encoded(flags, "<u4"),
                         "wavelength_maps_b64": encoded(wavelength_maps), "bandwidth_maps_b64": encoded(bandwidth_maps),
-                        "sources": sources, "measurements": measurements,
+                        "sources": sources, "measurements": measurements, "spectral_fft": spectral_fft,
+                        "fft_unavailable": None if spectral_fft else payload["fft_unavailable"],
                         "data_status": "ready" if cutouts else "empty",
                         "message": f"{len(cutouts)} observed cutouts / {len(unique)} matching images · MJy/sr" if cutouts else "No SPHEREx images in this field and time window",
                         "provenance": {"sia_url": SIA_URL, "collections": collections, "matched_images": len(unique),
@@ -394,5 +491,5 @@ def empty_sky(config, ra, dec, fov, window, release):
             "grid_size": GRID_SIZE, "pixel_scale_arcsec": fov / GRID_SIZE,
             "detectors": config["detectors"], "epochs": [], "sources": [], "flag_events": [],
             "frames_b64": "", "flags_b64": "", "wavelength_maps_b64": "", "bandwidth_maps_b64": "", "measurements": [],
-            "data_status": "loading", "message": "Loading live IRSA cutouts…",
+            "spectral_fft": None, "data_status": "loading", "message": "Loading live IRSA cutouts…",
             "fft_unavailable": "FFT needs a uniformly sampled spectrum; these cutouts are sparse, unequal-wavelength observations."}

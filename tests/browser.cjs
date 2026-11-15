@@ -131,8 +131,8 @@ const {chromium} = require('../.cache/browser/node_modules/playwright');
     await page.goto('http://127.0.0.1:8081/?ra=1&dec=2');
     await page.waitForFunction(()=>document.querySelector('#sed-title').textContent.includes('Field mean'));
     assert.ok(await page.locator('#sed-svg circle').count()>0);
-    assert.equal(await page.locator('[data-fft="low"]').isDisabled(),true);
-    assert.equal(await page.locator('#fft-svg rect.coverage').count(),6);
+    assert.equal(await page.locator('[data-fft="low"]').isDisabled(),false);
+    assert.equal(await page.locator('#fft-svg rect').count(),17);
 
     scenario='uniform-spectrum';
     await page.goto('http://127.0.0.1:8081/?ra=1&dec=2');
@@ -168,6 +168,7 @@ const {chromium} = require('../.cache/browser/node_modules/playwright');
     await page.goto('http://127.0.0.1:8081/?ra=1&dec=2');
     await page.waitForFunction(()=>document.querySelector('#data-status').textContent.includes('No observations'));
     assert.equal(await page.locator('#empty-view').isVisible(),true);
+    assert.equal(await page.locator('[data-fft="low"]').isDisabled(),true);
     assert.ok((await page.locator('#sed-svg').textContent()).includes('No valid measurements'));
     assert.ok((await page.locator('#timeline-svg').textContent()).includes('Dates appear'));
     assert.deepEqual(errors, []);

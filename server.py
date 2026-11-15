@@ -95,7 +95,7 @@ class SkyEngine:
         self.pending = {}
         self.errors = {}
         self.progress = {}
-        self.ttl = float(os.environ.get("SPHEREX_CACHE_TTL", "3600"))
+        self.ttl = float(os.environ.get("SPHEREX_CACHE_TTL", "604800"))
 
     def configuration(self):
         config = dict(self.config)
