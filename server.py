@@ -80,6 +80,24 @@ def cached_preview(candidates, config, query):
     return None
 
 
+def compact_sky_payload(sky):
+    payload = dict(sky)
+    epochs = payload.get("epochs") or []
+    frames_b64 = payload.get("frames_b64") or ""
+    if not epochs or not frames_b64:
+        return payload
+    grid = payload["grid_size"]
+    n_det = len(payload.get("detectors") or range(6))
+    frames = np.frombuffer(base64.b64decode(frames_b64), dtype="<f4").reshape((len(epochs), n_det, grid, grid))
+    planes = np.empty((len(epochs), grid, grid), dtype="<f4")
+    for idx, epoch in enumerate(epochs):
+        det = (epoch.get("detectors") or [1])[0] - 1
+        planes[idx] = frames[idx, det]
+    payload["frames_1d_b64"] = encoded(planes, "<f4")
+    payload["frames_b64"] = ""
+    return payload
+
+
 class SkyEngine:
     def __init__(self, directory=None, archive=None):
         self.config = load_config()
@@ -272,6 +290,31 @@ class SkyEngine:
                 results.append({"target": target["name"], "status": "error", "message": str(exc)})
         return results
 
+    def export_static(self, out_dir=None):
+        dest = Path(out_dir or BASE_DIR / "data")
+        dest.mkdir(parents=True, exist_ok=True)
+        config = self.configuration()
+        config["cached_targets"] = [
+            {"ra": target["ra"], "dec": target["dec"], "fov": target["fov"]}
+            for target in config["preset_targets"]
+        ]
+        exported = []
+        initial_sky = None
+        for idx, target in enumerate(config["preset_targets"]):
+            for sampling, fovs in (("preview", (150, 300, 600, 1200)), ("rgb", (150, 300, 600))):
+                for fov in fovs:
+                    sky = compact_sky_payload(
+                        self.get_sky_cube(target["ra"], target["dec"], fov, wait=True, sampling=sampling)
+                    )
+                    filename = f"sky-{idx}-{fov}-{sampling}.json"
+                    (dest / filename).write_text(json.dumps(sky, allow_nan=False, separators=(",", ":")), encoding="utf-8")
+                    exported.append(filename)
+                    if idx == 0 and sampling == "preview" and fov == target["fov"]:
+                        initial_sky = sky
+        state_payload = {"config": config, "initial_sky": initial_sky}
+        (dest / "state.json").write_text(json.dumps(state_payload, allow_nan=False, separators=(",", ":")), encoding="utf-8")
+        return exported
+
 
 class SpherexHandler(SimpleHTTPRequestHandler):
     engine = None
@@ -335,7 +378,7 @@ class SpherexHandler(SimpleHTTPRequestHandler):
             else:
                 self._send_json(sky)
             return
-        if parsed.path in ("/", "/index.html", "/app.js", "/style.css", "/vendor/d3.v7.min.js", "/vendor/aladin-3.8.2.js"):
+        if parsed.path in ("/", "/index.html", "/app.js", "/style.css", "/vendor/d3.v7.min.js", "/vendor/aladin-3.8.2.js") or re.fullmatch(r"/data/[A-Za-z0-9_.-]+\.json", parsed.path):
             del self.headers["If-Modified-Since"]
             del self.headers["If-None-Match"]
             self.path = "/index.html" if parsed.path == "/" else parsed.path
@@ -376,9 +419,15 @@ class SpherexHandler(SimpleHTTPRequestHandler):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--precache", action="store_true", help="Download and verify all five target previews, then exit")
+    parser.add_argument("--export-static", action="store_true", help="Export static JSON snapshots to data/ for GitHub Pages")
     parser.add_argument("--sampling", choices=("preview", "rgb"), default="preview", help="Observation sample to pre-cache")
     args = parser.parse_args()
     engine = SkyEngine()
+    if args.export_static:
+        exported = engine.export_static()
+        print(json.dumps({"exported": len(exported), "files": exported}, indent=2))
+        engine.pool.shutdown()
+        raise SystemExit(0)
     if args.precache:
         engine.prewarm(sampling=args.sampling)
         report = engine.prewarm(wait=True, sampling=args.sampling)
