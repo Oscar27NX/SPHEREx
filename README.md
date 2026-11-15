@@ -27,8 +27,6 @@ python server.py --export-static
 Open `http://127.0.0.1:8080`. The five challenge presets are available on startup (`releases.json`, resolved via CDS Sesame/SIMBAD on 2026-11-14). You can enter coordinates in decimal degrees or sexagesimal (for example `08h55m10.831s`, `-7d14m42.53s`), and click **Share URL** to copy an embeddable `?ra=...&dec=...&fov=...` link containing the displayed target's information.
 Open `http://127.0.0.1:8080`. The five challenge presets are available on startup: **Barnard's Star**, **Epsilon Indi B**, **WISE 0855**, **RW Aurigae**, and **R Draconis**. You can enter coordinates in decimal degrees or sexagesimal (for example `08h55m10.831s`, `-7d14m42.53s`), and click **Share URL** to copy an embeddable `?ra=...&dec=...&fov=...` link containing the displayed target's information.
 
-Alternatively, a demo containing only the data pertaining to the five challenge presets is readily available in the link: https://oscar27nx.github.io/SPHEREx/
-
 ## System overview
 
 1. **Browser boot**: Opening the page calls `GET /api/state` to load release metadata, presets, and the initial sky view, then warms remaining presets via `POST /api/batch`. On static hosts (such as GitHub Pages), `app.js` falls back cleanly to `data/state.json` and pre-fetches `data/sky-*.json` snapshots in the background.
