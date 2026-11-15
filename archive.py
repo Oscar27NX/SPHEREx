@@ -29,6 +29,7 @@ SIA_URL = "https://irsa.ipac.caltech.edu/SIA"
 TAP_URL = "https://irsa.ipac.caltech.edu/TAP/sync"
 GRID_SIZE = 64
 CACHE_VERSION = 3
+CUTOUT_WORKERS = 6
 
 
 class ArchiveError(RuntimeError):
@@ -39,7 +40,7 @@ def get_remote(url, params=None):
     retries = Retry(total=2, read=0, backoff_factor=0.5, status_forcelist=(429, 502, 503, 504))
     with requests.Session() as session:
         session.mount("https://", HTTPAdapter(max_retries=retries))
-        response = session.get(url, params=params, timeout=(10, 60))
+        response = session.get(url, params=params, timeout=(8, 25))
         response.raise_for_status()
         return response.content
 
@@ -346,12 +347,13 @@ class Archive:
             "wise": ("allwise_p3as_psd", "designation,ra,dec,w1mpro,w2mpro"),
         }
         results, errors = {}, {}
-        for kind, (catalog, columns) in queries.items():
+        def fetch_catalog(kind, catalog, columns):
             params = {"catalog": catalog, "spatial": "Cone", "objstr": f"{ra:.7f} {dec:.7f}",
                       "radius": fov / math.sqrt(2), "radunits": "arcsec", "outfmt": 3,
                       "selcols": columns, "outrows": 1000}
             key = "catalog:" + hashlib.sha256(json.dumps(params, sort_keys=True).encode()).hexdigest()
             cached = self.cache.get(key)
+            err = None
             if cached and time.time() - cached[0] < 86400 * 7:
                 rows = list(cached[1])
             else:
@@ -359,10 +361,10 @@ class Archive:
                     rows, overflow = read_votable(self.fetch("https://irsa.ipac.caltech.edu/cgi-bin/Gator/nph-query", params))
                     self.cache.put(key, rows)
                     if overflow or len(rows) == 1000:
-                        errors[kind] = "Catalog display limited to 1,000 sources"
+                        err = "Catalog display limited to 1,000 sources"
                 except Exception as exc:
                     rows = list(cached[1]) if cached else []
-                    errors[kind] = str(exc)
+                    err = str(exc)
             if fov > 300:
                 inner_params = dict(params, radius=300 / math.sqrt(2))
                 inner_key = "catalog:" + hashlib.sha256(json.dumps(inner_params, sort_keys=True).encode()).hexdigest()
@@ -374,12 +376,24 @@ class Archive:
                         if str(inner_row.get(id_field)) not in seen:
                             rows.append(inner_row)
                             seen.add(str(inner_row.get(id_field)))
-            results[kind] = rows
+            return rows, err
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            cat_futures = {kind: pool.submit(fetch_catalog, kind, catalog, columns) for kind, (catalog, columns) in queries.items()}
+            for kind in queries:
+                rows, err = cat_futures[kind].result()
+                results[kind] = rows
+                if err is not None:
+                    errors[kind] = err
         sources = []
         wcs = display_wcs(ra, dec, fov)
         for kind, rows in results.items():
-            for row in rows:
-                px, py = wcs.world_to_pixel_values(row["ra"], row["dec"])
+            if not rows:
+                continue
+            pxs, pys = wcs.world_to_pixel_values(
+                np.asarray([r["ra"] for r in rows], dtype=float),
+                np.asarray([r["dec"] for r in rows], dtype=float),
+            )
+            for row, px, py in zip(rows, pxs, pys):
                 in_box = -1 <= px < GRID_SIZE and -1 <= py < GRID_SIZE
                 if not in_box and kind == "gaia":
                     prop_ra, prop_dec = propagate_gaia_radec(
@@ -397,7 +411,9 @@ class Archive:
                                 "wise": row if kind == "wise" else None})
         return sources, errors
 
-    def build_sky(self, config, ra, dec, fov, window, release, progress=None):
+    def build_sky(self, config, ra, dec, fov, window, release, progress=None, sampling="preview"):
+        if sampling not in ("preview", "rgb"):
+            raise ValueError("Unknown observation sampling")
         report = progress or (lambda **kwargs: None)
         report(phase="discovery", completed=0, total=0)
         rows, collections = self.search(ra, dec, fov, window, release)
@@ -417,16 +433,16 @@ class Archive:
             if centered:
                 candidates = centered
             if candidates:
-                selected.append(candidates[0])
-                if len(candidates) > 1:
-                    selected.append(candidates[-1])
+                count = min(len(candidates), 12 if sampling == "rgb" and detector in (1, 3, 5) else 2)
+                selected.extend(candidates[i] for i in np.linspace(0, len(candidates) - 1, count, dtype=int))
         if not selected:
-            return dict(empty_sky(config, ra, dec, fov, window, release), data_status="empty",
+            return dict(empty_sky(config, ra, dec, fov, window, release), data_status="empty", sampling=sampling,
                         message="No data found for this field, release and time window. Try another location or release.",
                         provenance={"sia_url": SIA_URL, "collections": collections, "matched_images": len(unique), "queried_at": Time.now().isot + "Z"})
         cutouts, failures = [], []
         report(phase="cutouts", completed=0, total=len(selected))
-        with ThreadPoolExecutor(max_workers=3) as pool:
+        # six parallel IBE cutouts measured clearly faster than three, while twelve triggered IRSA 503 errors; the extra thread runs catalogs.
+        with ThreadPoolExecutor(max_workers=CUTOUT_WORKERS + 1) as pool:
             catalog_future = pool.submit(self.catalogs, ra, dec, fov)
             futures = {pool.submit(self.cutout, row, ra, dec, fov): row for row in selected}
             for future in as_completed(futures):
@@ -440,7 +456,7 @@ class Archive:
             sources, catalog_errors = catalog_future.result()
         if selected and not cutouts:
             raise ArchiveError("No selected cutout could be displayed: " + failures[0]["error"])
-        cutouts.sort(key=lambda c: c["mjd"])
+        cutouts.sort(key=lambda c: (c["mjd"], c["detector"]))
         payload = empty_sky(config, ra, dec, fov, window, release)
         frames = np.full((len(cutouts), 6, GRID_SIZE, GRID_SIZE), np.nan, dtype=np.float32)
         flags = np.zeros((len(cutouts), GRID_SIZE, GRID_SIZE), dtype=np.uint32)
@@ -471,7 +487,7 @@ class Archive:
                                      "detector": detector, "mjd": cutout["mjd"], "aperture_px": aperture_px})
         measurements.sort(key=lambda m: m["wavelength_um"])
         spectral_fft = resample_spectral_grid(measurements)
-        payload.update({"epochs": epochs, "frames_b64": encoded(frames), "flags_b64": encoded(flags, "<u4"),
+        payload.update({"sampling": sampling, "epochs": epochs, "frames_b64": encoded(frames), "flags_b64": encoded(flags, "<u4"),
                         "wavelength_maps_b64": encoded(wavelength_maps), "bandwidth_maps_b64": encoded(bandwidth_maps),
                         "sources": sources, "measurements": measurements, "spectral_fft": spectral_fft,
                         "fft_unavailable": None if spectral_fft else payload["fft_unavailable"],
@@ -479,7 +495,8 @@ class Archive:
                         "message": f"{len(cutouts)} observed cutouts / {len(unique)} matching images · MJy/sr" if cutouts else "No SPHEREx images in this field and time window",
                         "provenance": {"sia_url": SIA_URL, "collections": collections, "matched_images": len(unique),
                                        "search_scope": "exposures containing the field center; not a complete FOV mosaic",
-                                       "selection": "earliest and latest exposure per detector; preview subset",
+                                       "selection": ("up to 12 samples across the time-ordered exposures of D1/D3/D5; endpoints of other detectors; preview subset"
+                                                     if sampling == "rgb" else "earliest and latest exposure per detector; preview subset"),
                                        "images": [{k: v for k, v in c.items() if k not in ("frame", "flags", "wavelength_map", "bandwidth_map")} for c in cutouts],
                                        "cutout_errors": failures, "catalog_errors": catalog_errors,
                                        "queried_at": Time.now().isot + "Z"}})

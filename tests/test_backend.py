@@ -87,6 +87,36 @@ class SpectrumTests(unittest.TestCase):
 
 
 class ArchiveTests(unittest.TestCase):
+    def test_rgb_sampling_loads_intermediate_real_exposures_and_preserves_endpoints(self):
+        archive = Archive(self.cache)
+        rows = [{"obs_id": f"obs{i}", "t_min": 61000+i, "obs_collection": "spherex_dr1",
+                 "access_url": f"https://irsa.ipac.caltech.edu/ibe/data/spherex/dr1/obs{i}D{d}_spx_l2b-v2.fits"}
+                for d in range(1, 7) for i in range(20)]
+        rows.append(dict(rows[0], access_url=rows[0]["access_url"].replace("v2", "v1")))
+        downloaded = []
+        plane = encoded(np.ones((64, 64)))
+        flags = encoded(np.zeros((64, 64)), "<u4")
+        def cutout(row, *args):
+            downloaded.append(row)
+            detector = int(row["access_url"].split("D")[-1][0])
+            return {"detector": detector, "mjd": row["t_min"], "collection": row["obs_collection"],
+                    "frame": plane, "flags": flags, "wavelength_map": plane, "bandwidth_map": plane,
+                    "wavelength_um": float(detector), "bandwidth_um": .1, "center_brightness": 1.0}
+        with patch.object(archive, "search", return_value=(rows, ["spherex_dr1"])), \
+             patch.object(archive, "cutout", side_effect=cutout), patch.object(archive, "catalogs", return_value=([], {})):
+            preview = archive.build_sky(load_config(), 1, 2, 300, 10, "auto")
+            self.assertEqual(len(preview["epochs"]), 12)
+            downloaded.clear()
+            rgb = archive.build_sky(load_config(), 1, 2, 300, 10, "auto", sampling="rgb")
+        self.assertEqual(rgb["sampling"], "rgb")
+        self.assertEqual(len(rgb["epochs"]), 42)
+        self.assertEqual(len({row["access_url"] for row in downloaded}), 42)
+        self.assertTrue(all("v2" in row["access_url"] for row in downloaded))
+        for d in range(1, 7):
+            dates = [ep["mjd"] for ep in rgb["epochs"] if ep["detectors"] == [d]]
+            self.assertEqual(len(dates), 12 if d in (1, 3, 5) else 2)
+            self.assertEqual((dates[0], dates[-1]), (61000, 61019))
+
     def test_empty_sia_finishes_without_catalog_downloads(self):
         archive = Archive(self.cache)
         progress = []
@@ -197,6 +227,74 @@ class ArchiveTests(unittest.TestCase):
 
 
 class EngineTests(unittest.TestCase):
+    def test_rgb_refresh_finishing_during_preview_still_requests_the_completed_payload(self):
+        finish = threading.Event()
+        class FastArchive:
+            def build_sky(self, config, *query, **kwargs):
+                finish.wait(3)
+                return dict(empty_sky(config, *query), sampling="rgb", data_status="empty")
+        with tempfile.TemporaryDirectory() as directory:
+            engine = SkyEngine(directory, FastArchive())
+            try:
+                def preview(candidates, config, query):
+                    finish.set()
+                    for future in list(engine.pending.values()):
+                        future.result(timeout=3)
+                    return dict(empty_sky(config, *query), preview=True, data_status="ready")
+                with patch("server.cached_preview", side_effect=preview):
+                    pending = engine.get_sky_cube(1, 2, sampling="rgb")
+                self.assertTrue(pending["refreshing"])
+                complete = engine.get_sky_cube(1, 2, sampling="rgb")
+                self.assertFalse(complete["refreshing"])
+                self.assertEqual(complete["sampling"], "rgb")
+                self.assertEqual(complete["data_status"], "empty")
+            finally:
+                finish.set()
+                engine.pool.shutdown()
+
+    def test_rgb_loads_in_background_keeps_preview_and_has_a_separate_persistent_cache(self):
+        finish = threading.Event()
+        class SamplingArchive:
+            calls = []
+            def build_sky(self, config, *query, sampling="preview", **kwargs):
+                self.calls.append(sampling)
+                if sampling == "rgb":
+                    finish.wait(3)
+                count = 3 if sampling == "rgb" else 1
+                return dict(empty_sky(config, *query), sampling=sampling, data_status="ready", grid_size=4,
+                            epochs=[{"mjd": Time.now().mjd-i, "source": "spherex_dr1", "detectors": [1]} for i in range(count)],
+                            frames_b64=encoded(np.ones((count, 6, 4, 4))), flags_b64=encoded(np.zeros((count, 4, 4)), "<u4"),
+                            wavelength_maps_b64=encoded(np.ones((count, 4, 4))), bandwidth_maps_b64=encoded(np.ones((count, 4, 4))))
+        with tempfile.TemporaryDirectory() as directory:
+            archive = SamplingArchive()
+            engine = SkyEngine(directory, archive)
+            try:
+                engine.get_sky_cube(1, 2, wait=True)
+                start = time.perf_counter()
+                pending = engine.get_sky_cube(1, 2, sampling="rgb")
+                self.assertLess(time.perf_counter()-start, 1)
+                self.assertTrue(pending["preview"])
+                self.assertEqual(pending["requested_sampling"], "rgb")
+                self.assertEqual(len(pending["epochs"]), 1)
+                self.assertTrue(pending["refreshing"])
+                engine.get_sky_cube(1, 2, sampling="rgb")
+                finish.set()
+                rgb = engine.get_sky_cube(1, 2, sampling="rgb", wait=True)
+                self.assertEqual(len(rgb["epochs"]), 3)
+                self.assertEqual(archive.calls, ["preview", "rgb"])
+                restarted = SkyEngine(directory, archive)
+                try:
+                    self.assertEqual(len(restarted.get_sky_cube(1, 2)["epochs"]), 1)
+                    self.assertEqual(len(restarted.get_sky_cube(1, 2, sampling="rgb")["epochs"]), 3)
+                    self.assertEqual(archive.calls, ["preview", "rgb"])
+                    with self.assertRaises(ValueError):
+                        restarted.get_sky_cube(1, 2, sampling="unbounded")
+                finally:
+                    restarted.pool.shutdown()
+            finally:
+                finish.set()
+                engine.pool.shutdown()
+
     def test_pending_request_reports_real_progress(self):
         reported, finish = threading.Event(), threading.Event()
         class ReportingArchive:

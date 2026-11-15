@@ -85,11 +85,11 @@ class SkyEngine:
         self.config = load_config()
         self.cache = DiskCache(directory or os.environ.get("SPHEREX_CACHE_DIR", BASE_DIR / ".cache"))
         self.archive = archive or Archive(self.cache)
-        self.pool = ThreadPoolExecutor(max_workers=2)
+        self.pool = ThreadPoolExecutor(max_workers=6)
         self.lock = threading.Lock()
         self.memory = OrderedDict()
         with self.cache.connect() as db:
-            keys = [r[0] for r in db.execute("SELECT key FROM cache WHERE key LIKE 'sky:%' ORDER BY created DESC LIMIT 24")]
+            keys = [r[0] for r in db.execute("SELECT key FROM cache WHERE key LIKE 'sky:%' ORDER BY created DESC LIMIT 64")]
         for key in reversed(keys):
             self.memory[key] = self.cache.get(key)
         self.pending = {}
@@ -106,18 +106,19 @@ class SkyEngine:
             for name in collections if not name.endswith("_deep")]
         return config
 
-    def _refresh(self, key, query):
+    def _refresh(self, key, query, sampling="preview"):
         def progress(**values):
             with self.lock:
                 self.progress[key].update(values)
         try:
-            payload = self.archive.build_sky(self.config, *query, progress=progress)
+            options = {"sampling": sampling} if sampling != "preview" else {}
+            payload = self.archive.build_sky(self.config, *query, progress=progress, **options)
             self.cache.put(key, payload)
             with self.lock:
                 self.errors.pop(key, None)
                 self.memory[key] = (time.time(), payload)
                 self.memory.move_to_end(key)
-                while len(self.memory) > 24:
+                while len(self.memory) > 64:
                     self.memory.popitem(last=False)
             return payload
         except Exception as exc:
@@ -128,10 +129,12 @@ class SkyEngine:
             with self.lock:
                 self.progress.pop(key, None)
 
-    def get_sky_cube(self, ra, dec, fov_arcsec=300, window_years=10, release_id="auto", wait=False, force=False):
+    def get_sky_cube(self, ra, dec, fov_arcsec=300, window_years=10, release_id="auto", wait=False, force=False, sampling="preview"):
         started = time.perf_counter()
+        if sampling not in ("preview", "rgb"):
+            raise ValueError("Unknown observation sampling")
         query = normalize_query(ra, dec, fov_arcsec, window_years, release_id or "auto")
-        key = "sky:" + hashlib.sha256(json.dumps([CACHE_VERSION, *query]).encode()).hexdigest()
+        key = "sky:" + hashlib.sha256(json.dumps([CACHE_VERSION, *query, *([sampling] if sampling != "preview" else [])]).encode()).hexdigest()
         with self.lock:
             cached = self.memory.get(key)
             if cached:
@@ -152,7 +155,7 @@ class SkyEngine:
             error = self.errors.get(key)
             if stale and future is None and (force or error is None or time.time() - error[0] >= 60):
                 self.progress[key] = {"phase": "queued", "completed": 0, "total": 0, "started_at": time.time()}
-                future = self.pool.submit(self._refresh, key, query)
+                future = self.pool.submit(self._refresh, key, query, sampling)
                 self.pending[key] = future
         if wait and future:
             result = dict(future.result())
@@ -168,7 +171,8 @@ class SkyEngine:
             if error:
                 if result["data_status"] != "ready":
                     result.update(data_status="error", message="The archive is temporarily unavailable. Retrying shortly; try another target or release.")
-        result["refreshing"] = bool(future and not future.done())
+        result["refreshing"] = bool(future and (not future.done() or result.get("preview", False)))
+        result["requested_sampling"] = sampling
         with self.lock:
             progress = self.progress.get(key)
             if progress:
@@ -179,12 +183,13 @@ class SkyEngine:
         result["server_ms"] = round((time.perf_counter() - started) * 1000, 3)
         return result
 
-    def prewarm(self, wait=False):
+    def prewarm(self, wait=False, sampling="preview"):
         results = []
         for target in self.config["preset_targets"]:
             try:
-                sky = self.get_sky_cube(target["ra"], target["dec"], target["fov"], wait=wait)
+                sky = self.get_sky_cube(target["ra"], target["dec"], target["fov"], wait=wait, sampling=sampling)
                 results.append({"target": target["name"], "status": sky["data_status"], "cache": sky["cache"],
+                                "sampling": sampling,
                                 "epochs": len(sky["epochs"]), "message": sky["message"],
                                 "catalog_errors": sky.get("provenance", {}).get("catalog_errors", {}),
                                 "cutout_errors": sky.get("provenance", {}).get("cutout_errors", [])})
@@ -202,6 +207,13 @@ class SpherexHandler(SimpleHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
 
+    def end_headers(self):
+        if not self.path.startswith("/api/"):
+            self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+            self.send_header("Pragma", "no-cache")
+            self.send_header("Expires", "0")
+        super().end_headers()
+
     def _send_json(self, obj, status=HTTPStatus.OK):
         raw = json.dumps(obj, allow_nan=False, separators=(",", ":")).encode("utf-8")
         encodings = self.headers.get("Accept-Encoding", "").lower().replace(" ", "").split(",")
@@ -214,7 +226,9 @@ class SpherexHandler(SimpleHTTPRequestHandler):
             self.send_header("Content-Encoding", "gzip")
         self.send_header("Vary", "Accept-Encoding")
         self.send_header("Content-Length", str(len(raw)))
-        self.send_header("Cache-Control", "no-store")
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+        if self.path.startswith("/api/state"):
+            self.send_header("Clear-Site-Data", '"cache"')
         self.end_headers()
         try:
             self.wfile.write(raw)
@@ -240,13 +254,15 @@ class SpherexHandler(SimpleHTTPRequestHandler):
         if parsed.path in ("/api/sky", "/api/catalogs"):
             target = self.engine.config["preset_targets"][0]
             sky = self.engine.get_sky_cube(qs.get("ra", target["ra"]), qs.get("dec", target["dec"]),
-                                           qs.get("fov", 300), qs.get("window", 10), qs.get("release", "auto"))
+                                           qs.get("fov", 300), qs.get("window", 10), qs.get("release", "auto"), sampling=qs.get("sampling", "preview"))
             if parsed.path == "/api/catalogs":
                 self._send_json({"sources": sky["sources"], "status": sky["data_status"]})
             else:
                 self._send_json(sky)
             return
         if parsed.path in ("/", "/index.html", "/app.js", "/style.css", "/vendor/d3.v7.min.js", "/vendor/aladin-3.8.2.js"):
+            del self.headers["If-Modified-Since"]
+            del self.headers["If-None-Match"]
             self.path = "/index.html" if parsed.path == "/" else parsed.path
             super().do_GET()
             return
@@ -285,12 +301,14 @@ class SpherexHandler(SimpleHTTPRequestHandler):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--precache", action="store_true", help="Download and verify all five target previews, then exit")
+    parser.add_argument("--sampling", choices=("preview", "rgb"), default="preview", help="Observation sample to pre-cache")
     args = parser.parse_args()
     engine = SkyEngine()
     if args.precache:
-        engine.prewarm()
-        report = engine.prewarm(wait=True)
-        (engine.cache.directory / "precache-report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+        engine.prewarm(sampling=args.sampling)
+        report = engine.prewarm(wait=True, sampling=args.sampling)
+        report_name = "precache-rgb-report.json" if args.sampling == "rgb" else "precache-report.json"
+        (engine.cache.directory / report_name).write_text(json.dumps(report, indent=2), encoding="utf-8")
         print(json.dumps(report, indent=2))
         engine.pool.shutdown()
         raise SystemExit(0 if all(r["status"] == "ready" for r in report) else 1)

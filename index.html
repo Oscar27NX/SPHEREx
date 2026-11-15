@@ -5,7 +5,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>SPHEREx Minimalist Spectral &amp; Multi-Epoch Explorer</title>
-  <link rel="stylesheet" href="style.css" />
+  <link rel="stylesheet" href="style.css?v=3" />
   <script src="vendor/d3.v7.min.js"></script>
 </head>
 
@@ -59,7 +59,8 @@
         </div>
         <div id="loop-reset-ring"></div>
         <div id="data-status" role="status" aria-live="polite"></div>
-        <div id="retrieval-progress" class="hidden" role="status"><progress id="retrieval-bar" aria-label="Archive retrieval"></progress><span id="retrieval-label"></span></div>
+        <div id="retrieval-progress" class="hidden" role="status"><progress id="retrieval-bar"
+            aria-label="Archive retrieval"></progress><span id="retrieval-label"></span></div>
         <div id="overlay-status"></div>
         <div id="empty-view" class="hidden" role="status"></div>
         <div id="viewport-corner-info">
@@ -87,7 +88,8 @@
         <span class="cluster-label">Arrays</span>
         <button class="chip active" data-det="all">Available arrays</button>
         <button class="chip" data-det="fft2d">Spatial smoothing</button>
-        <button class="chip" data-det="rgb" title="False color: D5 red, D3 green, D1 blue. Blink uses the nearest observation per detector inside the time brush; channel dates can differ.">RGB (D1+D3+D5)</button>
+        <button class="chip" data-det="rgb"
+          title="Loads additional observed D1/D3/D5 images in the background. False color: D5 red, D3 green, D1 blue. Blink plays distinct nearest-date combinations inside the time brush. Channel dates can differ; no motion interpolation.">RGB</button>
         <button class="chip" data-det="D1">D1</button>
         <button class="chip" data-det="D2">D2</button>
         <button class="chip" data-det="D3">D3</button>
@@ -99,26 +101,26 @@
       <div class="control-cluster" id="fft-buttons">
         <span class="cluster-label">Spectral FFT</span>
         <button class="chip active" data-fft="raw">Raw</button>
-        <button class="chip" data-fft="low">Low modes</button>
-        <button class="chip" data-fft="mid">Mid modes</button>
-        <button class="chip" data-fft="high">High modes</button>
-        <button class="chip" id="btn-fft-demo" aria-pressed="false" title="Demonstrate Fourier filters with a labeled synthetic signal, not sky measurements">FFT demo</button>
+        <button class="chip" data-fft="low">Low</button>
+        <button class="chip" data-fft="mid">Mid</button>
+        <button class="chip" data-fft="high">High</button>
       </div>
 
       <div class="control-cluster" id="fov-buttons">
         <span class="cluster-label">FOV</span>
         <button class="chip" data-fov="150">150&Prime;</button>
         <button class="chip active" data-fov="300">300&Prime;</button>
-        <label class="coord-field">Custom <input id="input-fov" type="number" min="60" max="1800" step="1" value="300" aria-label="Field of view in arcseconds" />&Prime;</label>
         <button class="chip" data-fov="600">600&Prime;</button>
         <button class="chip" data-fov="1200">1200&Prime;</button>
+        <label class="coord-field">Custom <input id="input-fov" type="number" min="60" max="1800" step="1" value="300"
+            aria-label="Field of view in arcseconds" />&Prime;</label>
       </div>
 
       <div class="control-cluster" id="overlay-buttons">
         <span class="cluster-label">Overlays</span>
-        <button class="chip active" id="tog-gaia">Gaia DR3</button>
-        <button class="chip active" id="tog-wise">WISE</button>
-        <button class="chip active" id="tog-flags">Flags</button>
+        <button class="chip" id="tog-gaia">Gaia DR3</button>
+        <button class="chip" id="tog-wise">WISE</button>
+        <button class="chip" id="tog-flags">Flags</button>
         <button class="chip" id="tog-invert">Invert</button>
         <button class="chip" id="tog-aladin">Aladin</button>
       </div>
@@ -151,7 +153,7 @@
     </section>
   </div>
 
-  <script type="module" src="app.js"></script>
+  <script type="module" src="app.js?v=3"></script>
 </body>
 
 </html>

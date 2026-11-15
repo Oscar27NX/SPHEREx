@@ -82,6 +82,13 @@ test('inversion exactly complements the display stretch without changing data', 
   }
 });
 
+test('display stretch keeps the exact finite-sample percentiles and symmetric difference limits', () => {
+  const context=appContext();
+  assert.deepEqual(Array.from(vm.runInContext('stretchLimits([Array.from({length:101},(_,i)=>i),[1000,NaN,Infinity]])',context)),[1,99]);
+  assert.deepEqual(Array.from(vm.runInContext('stretchLimits([Array.from({length:101},(_,i)=>i),[1000,NaN]],true)',context)),[-99,99]);
+  assert.deepEqual(Array.from(vm.runInContext('stretchLimits([[NaN,Infinity]])',context)),[0,1]);
+});
+
 test('uniform spectral samples reconstruct through all three disjoint filters', () => {
   const context = appContext();
   const result = vm.runInContext(`spectralAnalysis(Array.from({length:12},(_,i)=>({wavelength_um:1+i*.1,brightness:3+Math.cos(2*Math.PI*i/4)})))`, context);
@@ -215,6 +222,7 @@ test('RGB blink renders known colors from three real channel planes and changes 
   assert.ok(vm.runInContext('original.every((v,i)=>Object.is(v,state.decoded.frames[i]))', context));
   vm.runInContext('state.winStart=2025.04;state.winEnd=2025.06;state.cursorEpochPos=0;renderCurrentFrame()', context);
   assert.ok(vm.runInContext('displayedEpochs().every(a=>a.idx>=3)', context));
+  assert.match(vm.runInContext("document.getElementById('active-epoch-readout').textContent", context), /^RGB 1\/1 .*Only one RGB combination/);
   assert.deepEqual(Array.from(context.rendered.slice(0, 4)), [255, 0, 255, 255]);
   vm.runInContext('state.winStart=2024;state.winEnd=2027', context);
   vm.runInContext("state.epochOps[2]='.';state.epochOps[5]='.';state.cursorEpochPos=0;renderCurrentFrame()", context);
@@ -233,6 +241,121 @@ test('the public FFT demo contains independently known low, mid, and high modes'
     assert.ok(Math.abs(result.fft_bands.mid[i] - .5 * Math.cos(2 * Math.PI * 12 * i / 48)) < 1e-9);
     assert.ok(Math.abs(result.fft_bands.high[i] - .25 * Math.cos(2 * Math.PI * 20 * i / 48)) < 1e-9);
   }
+});
+
+test('RGB playback skips reused channel selections, wraps, and handles single or missing combinations', () => {
+  const context=appContext();
+  vm.runInContext(`globalThis.active=[1,3,5,2,4,6,1,3,5,2,4,6].map((d,i)=>({idx:i,
+    ep:{detectors:[d],mjd:i<6?i:100+i}}));`,context);
+  assert.deepEqual(Array.from(vm.runInContext('rgbPlaybackPositions(active)',context)),[0,6]);
+  assert.equal(vm.runInContext("nextPlaybackPosition(active,2,'rgb')",context),6);
+  assert.equal(vm.runInContext("nextPlaybackPosition(active,7,'rgb')",context),0);
+  assert.equal(vm.runInContext("nextPlaybackPosition(active,2,'all')",context),3);
+  assert.equal(vm.runInContext("nextPlaybackPosition(active.slice(0,6),4,'rgb')",context),4);
+  assert.equal(vm.runInContext("nextPlaybackPosition(active.slice(0,2),0,'rgb')",context),1);
+  assert.equal(vm.runInContext("nextPlaybackPosition([],0,'rgb')",context),0);
+  assert.deepEqual(Array.from(vm.runInContext('rgbPlaybackPositions(active.filter(a=>a.idx>=6))',context)),[0]);
+  vm.runInContext('globalThis.staggered=[1,3,5,1,3,5].map((d,i)=>({idx:i,ep:{detectors:[d],mjd:i}}));',context);
+  assert.deepEqual(Array.from(vm.runInContext('rgbPlaybackPositions(staggered)',context)),[0,2,3,4]);
+});
+
+test('RGB requests more observations while immediately showing the separate preview cache', async () => {
+  let finish;
+  const requests=[];
+  const context=appContext({fetch:url=>{requests.push(url);return new Promise(resolve=>{finish=resolve;});}});
+  vm.runInContext(`globalThis.applied=[];applySkyData=sky=>applied.push(sky.sampling || 'preview');
+    globalThis.preview={ra:1,dec:2,fov:300,window:10,release:{id:'auto'},data_status:'ready'};
+    rememberSky(preview);state.detector='rgb';`,context);
+  const pending=vm.runInContext('querySky(1,2,300)',context);
+  assert.deepEqual(Array.from(context.applied),['preview']);
+  assert.equal(new URL(requests[0],'http://local').searchParams.get('sampling'),'rgb');
+  finish({ok:true,json:async()=>({...context.preview,sampling:'rgb',epochs:[{}]})});
+  await pending;
+  assert.deepEqual(Array.from(context.applied),['preview','rgb']);
+  assert.equal(vm.runInContext('state.clientCache.size',context),2);
+  const cached=vm.runInContext('querySky(1,2,300)',context);
+  assert.equal(context.applied.at(-1),'rgb');
+  finish({ok:true,json:async()=>({data_status:'loading'})});
+  await cached;
+});
+
+test('background RGB enrichment preserves the brush, skipped epochs and current observation', () => {
+  const context=appContext();
+  vm.runInContext(`state.ra=1;state.dec=2;state.detector='rgb';
+    globalThis.epoch=i=>({year:2025+i/100,mjd:61000+i,detectors:[1],source:'spherex_dr1'});
+    state.sky={epochs:[0,5,10].map(epoch)};state.winStart=2025.02;state.winEnd=2025.07;
+    state.epochOps=['+','-','.'];state.cursorEpochPos=0;
+    globalThis.enriched={epochs:[0,3,5,6,10].map(epoch)};
+    updateEpochSelection(state.sky,enriched,true);`,context);
+  assert.equal(vm.runInContext('state.winStart',context),2025.02);
+  assert.equal(vm.runInContext('state.winEnd',context),2025.07);
+  assert.equal(vm.runInContext('state.cursorEpochPos',context),1);
+  assert.deepEqual(Array.from(vm.runInContext('state.epochOps',context)),['+','+','-','+','.']);
+  vm.runInContext(`state.sky=enriched;state.winStart=2025;state.winEnd=2025.1;
+    updateEpochSelection(state.sky,{epochs:[0,3,5,6,10,12].map(epoch)},true);`,context);
+  assert.equal(vm.runInContext('state.winEnd',context),2025.12);
+});
+
+test('RGB FOV changes retain expanded observations while a smaller server preview is pending', async () => {
+  let finish;
+  const context=appContext({fetch:()=>new Promise(resolve=>{finish=resolve;})});
+  vm.runInContext(`state.detector='rgb';globalThis.applied=[];
+    applySkyData=sky=>{state.sky=sky;applied.push(sky.epochs.length)};
+    globalThis.rich={ra:1,dec:2,fov:300,window:10,release:{id:'auto'},sampling:'rgb',data_status:'ready',sources:[],measurements:[],
+      epochs:[0,1,2].map(i=>({mjd:Date.now()/86400000+40585+i/10,source:'spherex_dr1',detectors:[1]}))};
+    globalThis.base={...rich,fov:150,sampling:'preview',epochs:rich.epochs.slice(0,1)};
+    for(const sky of [rich,base]) {
+      decodedCache.set(sky,{grid:4,nDet:1,nEpochs:sky.epochs.length,frames:new Float32Array(sky.epochs.length*16).fill(5),
+        flags:new Uint32Array(sky.epochs.length*16),wavelengths:new Float32Array(sky.epochs.length*16).fill(1),
+        bandwidths:new Float32Array(sky.epochs.length*16).fill(.1)});rememberSky(sky);
+    }`,context);
+  const pending=vm.runInContext('querySky(1,2,150)',context);
+  assert.deepEqual(Array.from(context.applied),[3]);
+  assert.equal(vm.runInContext('state.sky.fov',context),150);
+  finish({ok:true,json:async()=>({...context.base,preview:true,refreshing:true})});
+  await pending;
+  assert.deepEqual(Array.from(context.applied),[3]);
+  assert.equal(vm.runInContext('state.clientCache.size',context),2);
+});
+
+test('RGB timer respects pause and mode, resumes after widening a single-combination brush', () => {
+  const context=appContext();
+  vm.runInContext(`window.setInterval=(fn,ms)=>{globalThis.tick=fn;globalThis.interval=ms;return 1};window.clearInterval=()=>{};
+    globalThis.all=[1,3,5,1,3,5].map((d,i)=>({idx:i,ep:{detectors:[d],mjd:i<3?i:100+i}}));
+    globalThis.active=all;getActiveEpochs=()=>active;globalThis.renders=0;globalThis.wraps=0;
+    renderCurrentFrame=()=>renders++;triggerLoopFlash=()=>wraps++;
+    state.playing=true;state.detector='rgb';state.mode='blink';state.speedMs=220;restartBlinkLoop();tick();`,context);
+  assert.equal(context.interval,220);
+  assert.equal(vm.runInContext('state.cursorEpochPos',context),3);
+  vm.runInContext('state.playing=false;tick()',context);
+  assert.equal(context.renders,1);
+  vm.runInContext("state.playing=true;state.mode='coadd';tick()",context);
+  assert.equal(context.renders,1);
+  vm.runInContext("state.mode='blink';active=all.slice(3);state.cursorEpochPos=0;tick()",context);
+  assert.equal(context.renders,1);
+  vm.runInContext('active=all;tick();tick()',context);
+  assert.equal(context.renders,3);
+  assert.equal(context.wraps,1);
+});
+
+test('RGB playback preserves a known three-pixel source shift without temporal blending', () => {
+  const context=appContext();
+  vm.runInContext(`renderSkyOverlay=()=>{};updateTimelineCursor=()=>{};highlightEpochChip=()=>{};
+    document.getElementById('sky-canvas').getContext=()=>({clearRect(){},
+      createImageData:(w,h)=>({data:new Uint8Array(w*h*4)}),putImageData:image=>globalThis.rendered=image.data});
+    state.mode='blink';state.detector='rgb';state.winStart=2024;state.winEnd=2027;state.cursorEpochPos=0;
+    state.epochOps=Array(6).fill('+');
+    state.sky={epochs:[1,3,5,1,3,5].map((d,i)=>({year:2025+i*.1,mjd:60000+(i<3?i:100+i),
+      detectors:[d],label:'date'+i+' D'+d,source:'test'}))};
+    state.decoded={grid:8,nDet:6,frames:new Float32Array(6*6*64).fill(NaN)};
+    state.sky.epochs.forEach((ep,i)=>{const d=ep.detectors[0],offset=(i*6+d-1)*64;
+      state.decoded.frames.fill(0,offset,offset+64);
+      for(let y=3;y<5;y++)for(let x=(i<3?1:4);x<(i<3?3:6);x++)state.decoded.frames[offset+y*8+x]=10*d;
+    });renderCurrentFrame();`,context);
+  const positions=values=>Array.from({length:64},(_,p)=>p).filter(p=>values[p*4]>0).map(p=>[p%8,Math.floor(p/8)]);
+  assert.deepEqual(positions(context.rendered),[[1,3],[2,3],[1,4],[2,4]]);
+  vm.runInContext('state.cursorEpochPos=nextPlaybackPosition(getActiveEpochs(),state.cursorEpochPos);renderCurrentFrame()',context);
+  assert.deepEqual(positions(context.rendered),[[4,3],[5,3],[4,4],[5,4]]);
 });
 
 test('non-uniform SPHEREx multi-detector and single-detector LVF cutouts produce additive gridded FFT spectra', () => {
@@ -275,4 +398,18 @@ test('spatial smoothing mode propagates neighbor artifact flags and diff unconfi
   const summary = vm.runInContext('flagSummaryAt(4)', context);
   assert.ok(summary.labels.includes('BLOOM'));
   assert.equal(vm.runInContext("state.mode='diff';displayedFlagsAt(0)", context), 0);
+});
+
+test('sexagesimal and decimal coordinates parse accurately in inputs and URL parameters', () => {
+  const context = appContext();
+  const expectedRa = (8 + 55 / 60 + 10.831 / 3600) * 15;
+  const expectedDec = -(7 + 14 / 60 + 42.53 / 3600);
+  assert.ok(Math.abs(vm.runInContext("parseCoordinate('08h55m10.831s', true)", context) - expectedRa) < 1e-10);
+  assert.ok(Math.abs(vm.runInContext("parseCoordinate('-7d14m42.53s', false)", context) - expectedDec) < 1e-10);
+  assert.ok(Math.abs(vm.runInContext("parseCoordinate('08:55:10.831', true)", context) - expectedRa) < 1e-10);
+  assert.ok(Math.abs(vm.runInContext("parseCoordinate('-07:14:42.53', false)", context) - expectedDec) < 1e-10);
+  assert.equal(vm.runInContext("Number.isNaN(parseCoordinate('08h75m00s', true))", context), true);
+  vm.runInContext("window.location.search='?ra=08h55m10.831s&dec=-7d14m42.53s';parseUrlParams()", context);
+  assert.ok(Math.abs(vm.runInContext('state.ra', context) - expectedRa) < 1e-10);
+  assert.ok(Math.abs(vm.runInContext('state.dec', context) - expectedDec) < 1e-10);
 });

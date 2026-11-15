@@ -52,9 +52,6 @@ const {chromium} = require('../.cache/browser/node_modules/playwright');
     }
     await page.locator('#btn-play-pause').click();
     await page.screenshot({path:'.cache/latency-preview.png'});
-    await page.locator('#btn-fft-demo').click();
-    assert.equal(await page.locator('#fft-svg rect').count(),25);
-    await page.screenshot({path:'.cache/fft-demo.png'});
     assert.deepEqual(errors,[]);
     const report={measuredAt:new Date().toISOString(),method:'DOM click to second animation frame, real cached observations, no API mocks',
       errors,targets,timings,rgbPlaybackTargets,maxMs:Math.max(...timings.map(t=>t.ms))};

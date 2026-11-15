@@ -2,6 +2,8 @@
 
 Verified on 2026-11-15. This supersedes the earlier sprint's RGB-in-Blink grayscale behavior.
 
+The later [RGB playback verification](rgb-motion-verification.md) corrects redundant playback ticks. The measurements below describe the earlier color correction; current playback skips unchanged channel selections, so these cached targets now have two displayed combinations per cycle instead of twelve cursor frames.
+
 ## Diagnosis
 
 The previous renderer could produce color in Mean mode. However, Blink passed a single detector exposure to the RGB coverage check. Every cached exposure contained one detector, so every Blink frame took the whole-image grayscale fallback. This was intentional fallback code, but it made the RGB control ineffective in the default playback mode.

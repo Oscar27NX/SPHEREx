@@ -43,6 +43,20 @@ let timelineScale = null;
 const decodedCache = new WeakMap();
 const stretchCache = new Map();
 
+function parseCoordinate(value, isRa = false) {
+  if (typeof value === "number") return value;
+  const raw = String(value ?? "").trim();
+  if (!raw) return NaN;
+  if (/^[+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?°?$/i.test(raw)) return Number(raw.replace(/°$/, ""));
+  const m = raw.match(/^([+-])?\s*(\d+(?:\.\d+)?)\s*([hd°:\s])\s*(\d+(?:\.\d+)?)\s*(?:[m'′:\s]\s*(\d+(?:\.\d+)?))?\s*[s"″]?$/i);
+  if (!m) return NaN;
+  const deg = Number(m[2]), min = Number(m[4]), sec = Number(m[5] || 0);
+  if (min >= 60 || sec >= 60) return NaN;
+  const sign = m[1] === "-" ? -1 : 1;
+  const scale = isRa && !/[d°]/i.test(m[3]) ? 15 : 1;
+  return sign * (deg + min / 60 + sec / 3600) * scale;
+}
+
 function parseUrlParams() {
   const merged = new URLSearchParams(window.location.search);
   const hash = window.location.hash.replace(/^#/, "");
@@ -54,8 +68,8 @@ function parseUrlParams() {
   }
   const hasRaDec = merged.has("ra") && merged.has("dec");
   if (hasRaDec) {
-    const parsedRa = Number.parseFloat(merged.get("ra"));
-    const parsedDec = Number.parseFloat(merged.get("dec"));
+    const parsedRa = parseCoordinate(merged.get("ra"), true);
+    const parsedDec = parseCoordinate(merged.get("dec"), false);
     if (Number.isFinite(parsedRa)) state.ra = ((parsedRa % 360) + 360) % 360;
     if (Number.isFinite(parsedDec)) state.dec = Math.max(-89.9, Math.min(89.9, parsedDec));
   }
@@ -131,8 +145,28 @@ function decodeSkyPayload(sky) {
   };
 }
 
-function skyCacheKey(ra, dec, fov, win, releaseId) {
-  return `${ra.toFixed(6)}|${dec.toFixed(6)}|${fov.toFixed(3)}|${win.toFixed(3)}|${releaseId}`;
+function skyCacheKey(ra, dec, fov, win, releaseId, sampling = "preview") {
+  return `${ra.toFixed(6)}|${dec.toFixed(6)}|${fov.toFixed(3)}|${win.toFixed(3)}|${releaseId}${sampling === "rgb" ? "|rgb" : ""}`;
+}
+
+function updateEpochSelection(previousSky, sky, sameView) {
+  const identity = ep => `${ep.source}|${ep.mjd}|${ep.detectors.join(",")}`;
+  const preserve = sameView && previousSky?.epochs.length && sky.epochs.length;
+  const previousActive = getActiveEpochs();
+  const cursorMjd = previousActive[state.cursorEpochPos % previousActive.length]?.ep.mjd;
+  const operations = new Map((previousSky?.epochs || []).map((ep, i) => [identity(ep), state.epochOps[i] || "+"]));
+  state.epochOps = sky.epochs.map(ep => preserve ? operations.get(identity(ep)) || "+" : "+");
+  const margin = epochWindowMargin();
+  if (!preserve || state.winStart <= previousSky.epochs[0].year + margin) state.winStart = sky.epochs[0]?.year ?? 0;
+  if (!preserve || state.winEnd >= previousSky.epochs.at(-1).year - margin) state.winEnd = sky.epochs.at(-1)?.year ?? 0;
+  state.cursorEpochPos = 0;
+  if (preserve && Number.isFinite(cursorMjd)) {
+    const active = sky.epochs.filter((ep, i) => ep.year >= state.winStart - margin && ep.year <= state.winEnd + margin
+      && state.epochOps[i] !== "." && (!state.detector.startsWith("D") || ep.detectors.includes(Number(state.detector.slice(1)))));
+    active.forEach((ep, i) => {
+      if (Math.abs(ep.mjd - cursorMjd) < Math.abs(active[state.cursorEpochPos].mjd - cursorMjd)) state.cursorEpochPos = i;
+    });
+  }
 }
 
 function applySkyData(sky) {
@@ -140,6 +174,7 @@ function applySkyData(sky) {
     === skyCacheKey(sky.ra, sky.dec, sky.fov, sky.window, sky.release.id);
   const sameEpochs = state.sky && state.ra === sky.ra && state.dec === sky.dec
     && JSON.stringify(state.sky.epochs) === JSON.stringify(sky.epochs);
+  if (!sameEpochs) updateEpochSelection(state.sky, sky, sameView);
   state.sky = sky;
   if (!decodedCache.has(sky)) decodedCache.set(sky, decodeSkyPayload(sky));
   state.decoded = decodedCache.get(sky);
@@ -150,10 +185,6 @@ function applySkyData(sky) {
   state.windowYears = sky.window;
   state.releaseId = sky.release.id;
   if (!sameEpochs) {
-    state.epochOps = sky.epochs.map(() => "+");
-    state.winStart = sky.epochs[0]?.year ?? 0;
-    state.winEnd = sky.epochs.at(-1)?.year ?? 0;
-    state.cursorEpochPos = 0;
     state.selectedSource = null;
     state.spectrumPixel = null;
   }
@@ -176,7 +207,6 @@ function applySkyData(sky) {
   syncControlUi();
   renderEpochLegend();
   renderCurrentFrame();
-  renderSkyOverlay();
   renderSpectralCharts();
   renderTimelineBrush();
   syncAladinView();
@@ -220,7 +250,8 @@ function showRetrieval(sky = null, pending = false) {
   if (progress?.total) { bar.max = progress.total; bar.value = progress.completed; }
   else bar.removeAttribute("value");
   const phases = { queued: "Waiting for the archive worker", discovery: "Searching IRSA observations", cutouts: "Retrieving images", catalogs: "Retrieving catalog overlays" };
-  document.getElementById("retrieval-label").textContent = (phases[progress?.phase] || "Contacting the archive")
+  document.getElementById("retrieval-label").textContent = (state.detector === "rgb" ? "Loading more RGB observations · " : "")
+    + (phases[progress?.phase] || "Contacting the archive")
     + (progress?.total ? ` · ${progress.completed}/${progress.total} images checked` : "")
     + (progress?.elapsed_seconds ? ` · ${progress.elapsed_seconds}s elapsed` : "")
     + ". You can switch to a cached preset while waiting.";
@@ -229,13 +260,15 @@ function showRetrieval(sky = null, pending = false) {
 function rememberSky(sky) {
   if (sky.preview || (sky.data_status !== "ready" && sky.data_status !== "empty")) return;
   if (state.clientCache.size >= 32) state.clientCache.delete(state.clientCache.keys().next().value);
-  state.clientCache.set(skyCacheKey(sky.ra, sky.dec, sky.fov, sky.window, sky.release.id), { sky, at: Date.now() });
+  state.clientCache.set(skyCacheKey(sky.ra, sky.dec, sky.fov, sky.window, sky.release.id, sky.sampling), { sky, at: Date.now() });
 }
 
-function cachedSkyPreview(ra, dec, fov, win, releaseId) {
+function cachedSkyPreview(ra, dec, fov, win, releaseId, sampling = "preview") {
   const candidates = Array.from(state.clientCache.values(), entry => entry.sky)
     .filter(s => s.epochs?.length && Math.abs(s.ra - ra) < 1e-6 && Math.abs(s.dec - dec) < 1e-6 && s.window >= win)
-    .sort((a, b) => Number(a.fov < fov) - Number(b.fov < fov) || Math.abs(a.fov - fov) - Math.abs(b.fov - fov));
+    .sort((a, b) => (sampling === "rgb" ? Number(a.sampling !== "rgb") - Number(b.sampling !== "rgb") : 0)
+      || Number(a.fov < fov) - Number(b.fov < fov) || Math.abs(a.fov - fov) - Math.abs(b.fov - fov)
+      || b.epochs.length - a.epochs.length);
   const cutoff = Date.now() / 86400000 + 40587 - win * 365.25;
   for (const source of candidates) {
     const indices = source.epochs.flatMap((ep, i) => ep.mjd >= cutoff &&
@@ -289,9 +322,12 @@ async function querySky(ra, dec, fov = state.fov, win = state.windowYears, relea
     return;
   }
   ra = ((ra % 360) + 360) % 360;
-  const key = skyCacheKey(ra, dec, fov, win, releaseId);
+  const sampling = state.detector === "rgb" ? "rgb" : "preview";
+  const key = skyCacheKey(ra, dec, fov, win, releaseId, sampling);
   const cached = state.clientCache.get(key);
-  const preview = cached ? null : cachedSkyPreview(ra, dec, fov, win, releaseId);
+  const preview = cached ? null : (sampling === "rgb" ? cachedSkyPreview(ra, dec, fov, win, releaseId, sampling) : null)
+    || state.clientCache.get(skyCacheKey(ra, dec, fov, win, releaseId))?.sky
+    || cachedSkyPreview(ra, dec, fov, win, releaseId);
   if (cached || preview) applySkyData(cached?.sky || preview);
   else setDataStatus("Loading live IRSA cutouts…");
   showRetrieval(null, true);
@@ -299,19 +335,24 @@ async function querySky(ra, dec, fov = state.fov, win = state.windowYears, relea
   const controller = skyController;
   const timeout = setTimeout(() => { timedOut = true; controller.abort(); }, 15000);
   try {
-    const params = new URLSearchParams({ ra, dec, fov, window: win, release: releaseId });
+    const params = new URLSearchParams({ ra, dec, fov, window: win, release: releaseId, sampling });
     const resp = await fetch(`/api/sky?${params}`, { signal: skyController.signal });
     const sky = await resp.json();
     if (!resp.ok) throw new Error("Archive unavailable");
     if (serial !== requestSerial) return;
     showRetrieval(sky);
     rememberSky(sky);
-    if (sky.epochs?.length || (!cached && !preview) || sky.data_status === "empty") applySkyData(sky);
-    else setDataStatus("Refreshing cached observations. The archive is temporarily unavailable.");
+    const richerPreview = sky.preview && state.sky?.sampling === "rgb" && state.sky.epochs.length > sky.epochs.length
+      && skyCacheKey(state.sky.ra, state.sky.dec, state.sky.fov, state.sky.window, state.sky.release.id)
+      === skyCacheKey(sky.ra, sky.dec, sky.fov, sky.window, sky.release.id);
+    if (!richerPreview) {
+      if (sky.epochs?.length || (!cached && !preview) || sky.data_status === "empty") applySkyData(sky);
+      else setDataStatus("Refreshing cached observations. The archive is temporarily unavailable.");
+    }
     if (sky.data_status === "loading" || sky.refreshing) {
       refreshTimer = setTimeout(() => {
         if (serial === requestSerial) querySky(ra, dec, fov, win, releaseId);
-      }, 2000);
+      }, sky.epochs?.length ? 2000 : 500);
     } else if (["ready", "empty", "error"].includes(sky.data_status)) {
       refreshTimer = setTimeout(() => {
         if (serial === requestSerial) querySky(ra, dec, fov, win, releaseId);
@@ -412,10 +453,14 @@ function accumulateComposite(active, detSpec, outBuf) {
 }
 
 function stretchLimits(buffers, difference) {
-  const values = buffers.flatMap(b => Array.from(b).filter(Number.isFinite)).sort((a, b) => a - b);
-  if (!values.length) return [0, 1];
-  const lo = values[Math.floor((values.length - 1) * .01)];
-  const hi = values[Math.floor((values.length - 1) * .99)];
+  const values = new Float64Array(buffers.reduce((count, buffer) => count + buffer.length, 0));
+  let count = 0;
+  for (const buffer of buffers) for (const value of buffer) if (Number.isFinite(value)) values[count++] = value;
+  if (!count) return [0, 1];
+  const finite = values.subarray(0, count);
+  finite.sort();
+  const lo = finite[Math.floor((count - 1) * .01)];
+  const hi = finite[Math.floor((count - 1) * .99)];
   if (difference) { const span = Math.max(Math.abs(lo), Math.abs(hi), 1e-6); return [-span, span]; }
   return [lo, Math.max(lo + 1e-6, hi)];
 }
@@ -432,6 +477,27 @@ function nearestRgbEpochs(active, mjd) {
     }
     return closest;
   });
+}
+
+function rgbPlaybackPositions(active) {
+  const positions = [];
+  let previous = null;
+  active.forEach((entry, position) => {
+    const channels = nearestRgbEpochs(active, entry.ep.mjd);
+    const key = channels.every(Boolean) ? `rgb:${channels.map(a => a.idx).join(",")}` : `gray:${entry.idx}`;
+    if (key !== previous) positions.push(position);
+    previous = key;
+  });
+  return positions;
+}
+
+function nextPlaybackPosition(active, current, detector = state.detector) {
+  if (!active.length) return 0;
+  current %= active.length;
+  if (detector !== "rgb") return (current + 1) % active.length;
+  const positions = rgbPlaybackPositions(active);
+  if (positions.length <= 1) return current;
+  return positions.find(position => position > current) ?? positions[0];
 }
 
 function renderCurrentFrame() {
@@ -476,8 +542,13 @@ function renderCurrentFrame() {
       const dates = rgbEpochs.map(a => a.ep.mjd);
       const span = Math.max(...dates) - Math.min(...dates);
       const labels = rgbEpochs.map((a, i) => `${["R(D5)", "G(D3)", "B(D1)"][i]} ${a.ep.label.split(" ")[0]}`);
-      readout.textContent = `RGB nearest dates · ${labels.join(" / ")} · ${span.toFixed(1)} d span; non-simultaneous`;
+      const positions = rgbPlaybackPositions(active);
+      const current = state.cursorEpochPos % active.length;
+      const frame = positions.filter(position => position <= current).length;
+      readout.textContent = `RGB ${frame}/${positions.length} · ${labels.join(" / ")} · ${span.toFixed(1)} d span; non-simultaneous`
+        + (positions.length === 1 ? ". Only one RGB combination; widen the time brush to compare." : "");
       readout.title = `Cursor: ${slot.ep.label}\n` + rgbEpochs.map((a, i) => `${labels[i]} · ${a.ep.source} · MJD ${a.ep.mjd.toFixed(5)}`).join("\n")
+        + "\nPlayback skips unchanged channel selections; date intervals are not uniform. No temporal smoothing or interpolation."
         + "\nFalse-color visualization of real observations; channel stretches are independent. Not simultaneous photometry or a motion measurement.";
     }
     highlightEpochChip(slot.idx);
@@ -493,6 +564,7 @@ function renderCurrentFrame() {
     if (stretchCache.has(key)) return stretchCache.get(key);
     const all = [];
     if (state.mode === "blink") for (const epoch of active) {
+      if (spec.startsWith("D") && !epoch.ep.detectors.includes(Number(spec.slice(1)))) continue;
       const plane = new Float32Array(grid * grid); samplePlane(epoch.idx, spec, plane); all.push(plane);
     }
     const limits = stretchLimits(all.length ? all : [buffers[i]], state.mode === "diff");
@@ -692,15 +764,10 @@ function renderSkyOverlay() {
   const svg = d3.select("#sky-overlay-svg");
   svg.selectAll("*").remove();
 
-  const { sources, year } = overlaySources();
+  const { sources } = overlaySources();
   const labels = [];
   const epochs = displayedEpochs();
-  const singleFrame = epochs.length === 1;
-  if (state.showGaia) labels.push(`Gaia circles: PM estimate at ${singleFrame ? "frame" : "time-span midpoint"} ${year?.toFixed(2) || "reference epoch"}; missing PM stays at reference`);
-  if (state.showWise) labels.push("WISE diamonds: catalog positions (W1 3.4 µm / W2 4.6 µm; not motion-corrected)");
-  if (state.showFlags) labels.push(state.detector === "fft2d"
-    ? "Squares: 3×3 smoothed-neighborhood quality flags"
-    : singleFrame ? "Squares: frame quality flags" : "Squares: union of contributing quality flags");
+
   const selected = sources.find(s => s.id === state.selectedSource?.id);
   if (selected) labels.push(`${selected.kind}: ${selected.name}${selected.propagated ? " · approximate PM-only position" : " · reference position"}`);
   document.getElementById("overlay-status").textContent = labels.join(" · ");
@@ -1010,16 +1077,14 @@ function renderSpectralCharts() {
     ? "Field mean (pixel unavailable)"
     : state.spectrumPixel
       ? (apertureRadius > 0 ? `Selected-aperture (r=${apertureRadius}px)` : "Selected-pixel")
-      : (apertureRadius > 0 ? `Center PSF-aperture (r=${apertureRadius}px)` : "Center-pixel");
-  document.getElementById("sed-title").textContent = `${sourceLabel} brightness · MJy/sr`;
+      : (apertureRadius > 0 ? `Center PSF-aperture` : "Center-pixel");
+  document.getElementById("sed-title").textContent = `${sourceLabel} brightness`;
   document.getElementById("sed-subtitle").textContent = `${measurements.length} observations \u00b7 different dates`;
   if (state.fftDemo) {
     measurements = demoSpectralSamples();
     document.getElementById("sed-title").textContent = "FFT DEMO · synthetic signal · arbitrary units";
     document.getElementById("sed-subtitle").textContent = `Not sky measurements · ${state.fftFilter} modes`;
   }
-  document.getElementById("btn-fft-demo").classList.toggle("active", state.fftDemo);
-  document.getElementById("btn-fft-demo").setAttribute("aria-pressed", String(state.fftDemo));
   const spectrum = state.fftDemo ? spectralAnalysis(measurements) : observationSpectrum(measurements, active);
   const filtered = state.fftFilter !== "raw" ? spectrum.fft_bands?.[state.fftFilter] : null;
   renderSedSvg(filtered ? measurements.map((m, i) => ({ ...m, brightness: filtered[i] })) : measurements, spectrum);
@@ -1039,16 +1104,6 @@ function renderSedSvg(measurements, spectrum = {}) {
   const y = d3.scaleLinear().domain([min, max]).nice().range([h, 0]);
   group.append("g").attr("class", "axis").attr("transform", `translate(0,${h})`).call(d3.axisBottom(x).ticks(6).tickFormat(v => `${v} \u00b5m`));
   group.append("g").attr("class", "axis").call(d3.axisLeft(y).ticks(4));
-  if (measurements.length >= 2) {
-    const lineGen = d3.line().x(d => x(d.wavelength_um)).y(d => y(d.brightness));
-    group.append("path")
-      .datum(measurements)
-      .attr("class", "sed-curve")
-      .attr("fill", "none")
-      .attr("stroke", state.fftFilter === "raw" ? "rgba(148,163,184,0.45)" : "#38bdf8")
-      .attr("stroke-width", state.fftFilter === "raw" ? 1.1 : 1.5)
-      .attr("d", lineGen);
-  }
   group.selectAll("circle").data(measurements).join("circle")
     .attr("cx", m => x(m.wavelength_um)).attr("cy", m => y(m.brightness)).attr("r", 3)
     .attr("fill", m => state.sky.detectors[m.detector]?.color || "#38bdf8")
@@ -1067,7 +1122,7 @@ function renderFftSvg(source) {
   const amplitudes = source.fft_amplitude || [];
   const counts = Array.from({ length: 6 }, (_, d) => (source.measurements || []).filter(m => m.detector === d).length);
   document.getElementById("fft-subtitle").textContent = amplitudes.length
-    ? `${state.fftDemo ? "Synthetic demo · " : source.gridded ? "Gridded LVF spectrum · " : ""}|FFT| · period in wavelength space`
+    ? `${state.fftDemo ? "Synthetic demo · " : ""}|FFT| · period in wavelength space`
     : "Uniform wavelength sampling required";
   if (!amplitudes.length) state.fftFilter = "raw";
   document.querySelectorAll("#fft-buttons .chip[data-fft]").forEach(button => {
@@ -1080,7 +1135,7 @@ function renderFftSvg(source) {
     svg.append("text").attr("x", 12).attr("y", 28).attr("fill", "#94a3b8").text("No FFT for empty observation set.");
     svg.selectAll("rect.coverage").data(counts).join("rect").attr("class", "coverage")
       .attr("x", (_, i) => 12 + i * width / 6).attr("y", 65).attr("width", width / 6 - 5)
-      .attr("height", v => v * 5).attr("fill", (_, i) => state.sky.detectors[i]?.color || "#38bdf8");
+      .attr("height", v => v * 5).attr("fill", (_, i) => state.sky.detectors[i]?.color || "#38d8f8ff");
     svg.selectAll("text.coverage").data(counts).join("text").attr("class", "coverage")
       .attr("x", (_, i) => 12 + i * width / 6).attr("y", 55).attr("fill", "#94a3b8").text((v, i) => `D${i + 1}: ${v}`);
     document.getElementById("fft-subtitle").textContent = "No valid observations in current selection";
@@ -1097,23 +1152,12 @@ function renderFftSvg(source) {
     .attr("width", x.bandwidth()).attr("height", v => h - y(v))
     .attr("fill", (_, i) => {
       const frac = i / limit;
-      if (state.fftFilter === "low") return frac <= 1 / 3 ? "#38bdf8" : "rgba(56,189,248,0.22)";
-      if (state.fftFilter === "mid") return frac > 1 / 3 && frac <= 2 / 3 ? "#38bdf8" : "rgba(56,189,248,0.22)";
-      if (state.fftFilter === "high") return frac > 2 / 3 ? "#38bdf8" : "rgba(56,189,248,0.22)";
-      return "#38bdf8";
+      if (state.fftFilter === "low") return frac <= 1 / 3 ? "rgba(162, 0, 225, 1)" : "rgba(56,189,248,0.22)";
+      if (state.fftFilter === "mid") return frac > 1 / 3 && frac <= 2 / 3 ? "rgba(215, 113, 255, 1)" : "rgba(56,189,248,0.22)";
+      if (state.fftFilter === "high") return frac > 2 / 3 ? "rgba(228, 160, 255, 1)" : "rgba(56,189,248,0.22)";
+      return "#c0ecffff";
     })
     .append("title").text((v, i) => `Mode ${i} (${formatSpectralPeriod(source.fft_period_um[i])}): |FFT| = ${v.toPrecision(4)}`);
-  if (amplitudes.length >= 2) {
-    const envLine = d3.line().x((_, i) => (x(i) ?? 0) + x.bandwidth() / 2).y(v => y(v));
-    group.append("path")
-      .datum(amplitudes)
-      .attr("class", "fft-envelope")
-      .attr("fill", "none")
-      .attr("stroke", "#7dd3fc")
-      .attr("stroke-width", 1)
-      .attr("opacity", 0.7)
-      .attr("d", envLine);
-  }
   const ticks = [0, ...d3.range(1, amplitudes.length).filter(i => i % Math.max(1, Math.floor(amplitudes.length / 4)) === 0)];
   group.append("g").attr("class", "axis").attr("transform", `translate(0,${h})`)
     .call(d3.axisBottom(x).tickValues(ticks).tickFormat(i => formatSpectralPeriod(source.fft_period_um[i])));
@@ -1168,6 +1212,7 @@ function renderTimelineBrush() {
       state.winEnd = Math.max(y0, y1);
       const span = Math.max(0.01, state.winEnd - state.winStart);
       document.getElementById("time-subtitle").textContent = `${span.toFixed(2)} yr (${state.winStart.toFixed(2)}–${state.winEnd.toFixed(2)})`;
+      if (!event.sourceEvent || event.type === "end") return;
       renderEpochLegend();
       renderCurrentFrame();
       renderSpectralCharts();
@@ -1204,8 +1249,11 @@ function restartBlinkLoop() {
     if (!state.playing || state.mode !== "blink") return;
     const active = getActiveEpochs();
     if (active.length <= 1) return;
-    state.cursorEpochPos = (state.cursorEpochPos + 1) % active.length;
-    if (state.cursorEpochPos === 0) triggerLoopFlash();
+    const current = state.cursorEpochPos % active.length;
+    const next = nextPlaybackPosition(active, current);
+    if (next === current) return;
+    state.cursorEpochPos = next;
+    if (next < current) triggerLoopFlash();
     renderCurrentFrame();
   }, state.speedMs);
 }
@@ -1278,10 +1326,17 @@ function canvasPointToPixel(ev) {
 
 function bindEvents() {
   document.getElementById("btn-go-coords").addEventListener("click", () => {
-    const ra = Number.parseFloat(document.getElementById("input-ra").value);
-    const dec = Number.parseFloat(document.getElementById("input-dec").value);
+    const ra = parseCoordinate(document.getElementById("input-ra").value, true);
+    const dec = parseCoordinate(document.getElementById("input-dec").value, false);
     if (Number.isFinite(ra) && Number.isFinite(dec)) querySky(ra, dec);
+    else setDataStatus("Enter valid coordinates in decimal degrees or sexagesimal (e.g. 08h55m10.831s, -7d14m42.53s).");
   });
+
+  for (const id of ["input-ra", "input-dec"]) {
+    document.getElementById(id).addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter") document.getElementById("btn-go-coords").click();
+    });
+  }
 
   document.getElementById("preset-select").addEventListener("change", (ev) => {
     const idx = Number.parseInt(ev.target.value, 10);
@@ -1349,19 +1404,17 @@ function bindEvents() {
     btn.addEventListener("click", () => {
       document.querySelectorAll("#detector-buttons .chip").forEach((b) => b.classList.remove("active"));
       btn.classList.add("active");
+      const previousDetector = state.detector;
       state.detector = btn.dataset.det;
       renderCurrentFrame();
       renderSpectralCharts();
       syncUrlHash();
+      if (previousDetector !== state.detector && (previousDetector === "rgb" || state.detector === "rgb")) {
+        querySky(state.ra, state.dec);
+      }
     });
   });
 
-  document.getElementById("btn-fft-demo").addEventListener("click", () => {
-    state.fftDemo = !state.fftDemo;
-    state.fftFilter = "raw";
-    renderSpectralCharts();
-    syncUrlHash();
-  });
   document.querySelectorAll("#fft-buttons .chip[data-fft]").forEach((btn) => {
     btn.addEventListener("click", () => {
       document.querySelectorAll("#fft-buttons .chip[data-fft]").forEach((b) => b.classList.remove("active"));
@@ -1575,13 +1628,14 @@ function populatePresets(presets) {
 
 async function prefetchPresetsBatch(presets) {
   if (!presets || presets.length === 0) return;
-  const queries = presets.map((p) => ({
+  const fovs = [150, 300, 600, 1200];
+  const queries = presets.flatMap((p) => fovs.map((fov) => ({
     ra: p.ra,
     dec: p.dec,
-    fov: p.fov || 300,
+    fov,
     window: state.windowYears,
     release: state.releaseId
-  }));
+  })));
   try {
     const resp = await fetch("/api/batch", {
       method: "POST",
@@ -1605,6 +1659,7 @@ async function init() {
   const boot = await stateResp.json();
   if (!stateResp.ok) throw new Error("Could not initialize sky viewer");
   state.config = boot.config;
+  if (boot.initial_sky) rememberSky(boot.initial_sky);
   populateReleases(boot.config.releases);
   populatePresets(boot.config.preset_targets);
   if (!hasUrlCoords) {

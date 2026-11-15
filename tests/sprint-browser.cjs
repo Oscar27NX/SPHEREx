@@ -78,18 +78,11 @@ const {chromium}=require('../.cache/browser/node_modules/playwright');
 
     const imageBefore=await page.locator('#sky-canvas').evaluate(c=>c.toDataURL());
     const overlayBefore=await moving.getAttribute('cx');
-    await page.locator('#btn-fft-demo').click();
-    assert.ok((await page.locator('#sed-title').textContent()).includes('synthetic'));
-    assert.equal(await page.locator('#fft-svg rect').count(),25);
     for(const mode of ['low','mid','high']) {
       await page.locator(`[data-fft="${mode}"]`).click();
-      assert.equal(await page.locator('#sed-svg circle').count(),48);
       assert.equal(await page.locator('#sky-canvas').evaluate(c=>c.toDataURL()),imageBefore);
       assert.equal(await moving.getAttribute('cx'),overlayBefore);
     }
-    await page.reload();
-    await page.waitForFunction(()=>document.querySelector('#btn-fft-demo').getAttribute('aria-pressed')==='true');
-    await page.locator('#btn-fft-demo').click();
     assert.equal(await page.locator('[data-fft="low"]').isDisabled(),false);
     assert.equal(await page.locator('#fft-svg rect').count(),17);
 
