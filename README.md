@@ -8,7 +8,7 @@ A web explorer to visualize NASA SPHEREx sky timeline cutouts, built for the 202
 
 Open `https://oscar27nx.github.io/SPHEREx/`. All five NASA challenge presets (**Barnard's Star**, **Epsilon Indi B**, **WISE 0855**, **RW Aurigae**, and **R Draconis**) and all interactive controls (**Blink**, **Mean (+)**, **Diff (-)**, `D1`–`D6`, **RGB**, **Spatial smoothing**, **Spectral FFT**, **Gaia DR3**, **WISE**, **Flags**, **Aladin**, **Time Window Brush**, **Random**, and **Share URL**) work directly in the browser. Arbitrary new sky coordinates require running the local Python backend; we explain how to do so next.
 
-##Local server set-up (full live IRSA archive queries)
+##Local server set-up (full IRSA archive queries)
 
 Run from the `SPHEREx/` directory with Python 3.11 or newer:
 
