@@ -64,3 +64,5 @@ Open `http://127.0.0.1:8080`. The five challenge presets are available on startu
 | **D3.js v7** | Interactive brightness spectrum, FFT bar chart, and time-window brush | [`vendor/d3.v7.min.js`](vendor/d3.v7.min.js) / [d3js.org](https://d3js.org/) | [ISC License](vendor/LICENSE.d3) |
 | **Aladin Lite v3.8.2** | On-demand HiPS reference sky viewer | [`vendor/aladin-3.8.2.js`](vendor/aladin-3.8.2.js) / [CDS Aladin Lite](https://aladin.cds.unistra.fr/) | [GNU GPL v3](vendor/LICENSE.aladin) |
 | **Astropy, NumPy, SciPy, Requests** | FITS/VOTable parsing, SIP WCS reprojection, FFT, HTTP retries (`requirements.txt`) | [PyPI](https://pypi.org/) (`astropy`, `numpy`, `scipy`, `requests`) | BSD-3-Clause (Astropy, NumPy, SciPy); Apache-2.0 (Requests) |
+
+#### GPT-6 Astra and Gemini 4 Argon were used to generate code and build the functionality of the data pipeline.
