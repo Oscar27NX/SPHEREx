@@ -29,7 +29,8 @@ const state = {
   selectedSource: null,
   spectrumPixel: null,
   aladinInstance: null,
-  aladinSurvey: "P/allWISE/color"
+  aladinSurvey: "P/allWISE/color",
+  staticDemo: false
 };
 
 let blinkTimer = null;
@@ -160,14 +161,28 @@ function decodeBase64Typed(b64, TypedArrayCtor) {
 }
 
 function decodeSkyPayload(sky) {
+  const grid = sky.grid_size, nEpochs = sky.epochs.length, nDet = sky.detectors.length;
+  let frames;
+  if (sky.frames_1d_b64 && !sky.frames_b64) {
+    const planes = decodeBase64Typed(sky.frames_1d_b64, Float32Array);
+    const size = grid * grid;
+    frames = new Float32Array(nEpochs * nDet * size);
+    frames.fill(NaN);
+    for (let e = 0; e < nEpochs; e += 1) {
+      const d = (sky.epochs[e]?.detectors?.[0] || 1) - 1;
+      frames.set(planes.subarray(e * size, (e + 1) * size), (e * nDet + d) * size);
+    }
+  } else {
+    frames = decodeBase64Typed(sky.frames_b64, Float32Array);
+  }
   return {
-    frames: decodeBase64Typed(sky.frames_b64, Float32Array),
+    frames,
     wavelengths: decodeBase64Typed(sky.wavelength_maps_b64, Float32Array),
     bandwidths: decodeBase64Typed(sky.bandwidth_maps_b64, Float32Array),
     flags: decodeBase64Typed(sky.flags_b64, Uint32Array),
-    grid: sky.grid_size,
-    nEpochs: sky.epochs.length,
-    nDet: sky.detectors.length
+    grid,
+    nEpochs,
+    nDet
   };
 }
 
@@ -338,6 +353,76 @@ function cachedSkyPreview(ra, dec, fov, win, releaseId, sampling = "preview") {
   return null;
 }
 
+function findPresetIndex(ra, dec) {
+  const presets = state.config?.preset_targets || [];
+  let bestIdx = -1, bestD2 = Infinity;
+  for (let i = 0; i < presets.length; i += 1) {
+    const p = presets[i];
+    const tol = Math.max(p.fov || 300, 600) / 7200;
+    const refs = [[p.ra, p.dec]];
+    if (Number.isFinite(p.catalog_ra) && Number.isFinite(p.catalog_dec)) {
+      refs.push([p.catalog_ra, p.catalog_dec]);
+    }
+    for (const [refRa, refDec] of refs) {
+      const dra = Math.abs((((refRa - ra + 180) % 360) + 360) % 360 - 180);
+      const ddec = Math.abs(refDec - dec);
+      if (dra <= tol && ddec <= tol) {
+        const d2 = dra * dra + ddec * ddec;
+        if (d2 < bestD2) { bestIdx = i; bestD2 = d2; }
+      }
+    }
+  }
+  return bestIdx;
+}
+
+async function fetchStaticSky(ra, dec, fov, win, releaseId, sampling, signal) {
+  const idx = findPresetIndex(ra, dec);
+  if (idx < 0) {
+    return {
+      release: { id: releaseId }, ra, dec, fov, window: win, grid_size: 64, pixel_scale_arcsec: fov / 64,
+      detectors: state.config?.detectors || [], epochs: [], sources: [], flag_events: [],
+      frames_b64: "", flags_b64: "", wavelength_maps_b64: "", bandwidth_maps_b64: "", measurements: [],
+      spectral_fft: null, data_status: "empty", refreshing: false, requested_sampling: sampling,
+      message: "Static demo mode: choose one of the 5 pre-cached NASA targets, or run server.py locally for live IRSA queries."
+    };
+  }
+  const preset = state.config.preset_targets[idx];
+  const fovs = sampling === "rgb" ? [150, 300, 600] : [150, 300, 600, 1200];
+  const baseFov = fovs.find(f => f >= fov) || fovs[fovs.length - 1];
+  const baseKey = skyCacheKey(preset.ra, preset.dec, baseFov, 10, "auto", sampling);
+  let baseSky = state.clientCache.get(baseKey)?.sky;
+  if (!baseSky) {
+    const resp = await fetch(`data/sky-${idx}-${baseFov}-${sampling}.json`, { signal });
+    if (!resp.ok) throw new Error("Static preset unavailable");
+    baseSky = await resp.json();
+    rememberSky(baseSky);
+  }
+  if (Math.round(fov) === baseFov && Math.abs(win - 10) < 1e-3 && releaseId === "auto") {
+    const exact = { ...baseSky, preview: false, refreshing: false, requested_sampling: sampling };
+    if (decodedCache.has(baseSky)) decodedCache.set(exact, decodedCache.get(baseSky));
+    return exact;
+  }
+  const derived = cachedSkyPreview(preset.ra, preset.dec, fov, win, releaseId, sampling);
+  if (!derived) {
+    const fallback = { ...baseSky, preview: false, refreshing: false, requested_sampling: sampling };
+    if (decodedCache.has(baseSky)) decodedCache.set(fallback, decodedCache.get(baseSky));
+    return fallback;
+  }
+  const finalSky = {
+    ...derived,
+    preview: false,
+    refreshing: false,
+    sampling: baseSky.sampling || sampling,
+    requested_sampling: sampling,
+    data_status: derived.epochs.length ? "ready" : "empty",
+    message: derived.epochs.length
+      ? `${derived.epochs.length} observed cutouts · MJy/sr`
+      : "No SPHEREx images in this field and time window"
+  };
+  decodedCache.set(finalSky, decodedCache.get(derived));
+  return finalSky;
+}
+
 async function querySky(ra, dec, fov = state.fov, win = state.windowYears, releaseId = state.releaseId, fromRandom = false) {
   const serial = ++requestSerial;
   clearTimeout(refreshTimer);
@@ -346,6 +431,18 @@ async function querySky(ra, dec, fov = state.fov, win = state.windowYears, relea
   if (![ra, dec, fov, win].every(Number.isFinite) || dec < -90 || dec > 90 || fov < 60 || fov > 1800) {
     setDataStatus("Enter valid coordinates and a FOV between 60 and 1800 arcseconds.");
     return;
+  }
+  if (fromRandom && state.staticDemo) {
+    const pool = state.config?.preset_targets || [];
+    const others = pool.filter(t => Math.abs(t.ra - state.ra) > 1e-3 || Math.abs(t.dec - state.dec) > 1e-3);
+    const picks = others.length ? others : pool;
+    if (picks.length) {
+      const chosen = picks[Math.floor(Math.random() * picks.length)];
+      ra = chosen.ra;
+      dec = chosen.dec;
+      fov = chosen.fov || fov;
+      fromRandom = false;
+    }
   }
   ra = ((ra % 360) + 360) % 360;
   [ra, dec] = resolveKnownCoords(ra, dec);
@@ -363,9 +460,22 @@ async function querySky(ra, dec, fov = state.fov, win = state.windowYears, relea
   const timeout = setTimeout(() => { timedOut = true; controller.abort(); }, 15000);
   try {
     const params = new URLSearchParams({ ra, dec, fov, window: win, release: releaseId, sampling });
-    const resp = await fetch(`/api/sky?${params}`, { signal: skyController.signal });
-    const sky = await resp.json();
-    if (!resp.ok) throw new Error("Archive unavailable");
+    let sky;
+    if (state.staticDemo) {
+      sky = await fetchStaticSky(ra, dec, fov, win, releaseId, sampling, skyController.signal);
+    } else {
+      const resp = await fetch(`/api/sky?${params}`, { signal: skyController.signal });
+      if (!resp.ok) {
+        if (resp.status === 404) {
+          state.staticDemo = true;
+          sky = await fetchStaticSky(ra, dec, fov, win, releaseId, sampling, skyController.signal);
+        } else {
+          throw new Error("Archive unavailable");
+        }
+      } else {
+        sky = await resp.json();
+      }
+    }
     if (serial !== requestSerial) return;
     if (sky.data_status === "error" && fromRandom) {
       const pool = (state.config?.cached_targets?.length ? state.config.cached_targets : state.config?.preset_targets) || [];
@@ -385,11 +495,11 @@ async function querySky(ra, dec, fov = state.fov, win = state.windowYears, relea
       if (sky.epochs?.length || (!cached && !preview) || sky.data_status === "empty") applySkyData(sky);
       else setDataStatus("Refreshing cached observations. The archive is temporarily unavailable.");
     }
-    if (sky.data_status === "loading" || sky.refreshing) {
+    if (!state.staticDemo && (sky.data_status === "loading" || sky.refreshing)) {
       refreshTimer = setTimeout(() => {
         if (serial === requestSerial) querySky(ra, dec, fov, win, releaseId, fromRandom);
       }, sky.epochs?.length ? 2000 : 500);
-    } else if (["ready", "empty", "error"].includes(sky.data_status)) {
+    } else if (!state.staticDemo && ["ready", "empty", "error"].includes(sky.data_status)) {
       refreshTimer = setTimeout(() => {
         if (serial === requestSerial) querySky(ra, dec, fov, win, releaseId, false);
       }, 60000);
@@ -1481,6 +1591,11 @@ function bindEvents() {
   });
 
   document.getElementById("btn-reload-releases").addEventListener("click", async () => {
+    if (state.staticDemo) {
+      if (state.config?.releases) populateReleases(state.config.releases);
+      setDataStatus("Static demo mode: release list loaded from pre-cached snapshot.");
+      return;
+    }
     try {
       const resp = await fetch("/api/releases/reload", { method: "POST" });
       if (!resp.ok) throw new Error("Release discovery unavailable");
@@ -1754,6 +1869,20 @@ function populatePresets(presets) {
 
 async function prefetchPresetsBatch(presets) {
   if (!presets || presets.length === 0) return;
+  if (state.staticDemo) {
+    const defaultJobs = presets.map((p, i) => fetch(`data/sky-${i}-${p.fov || 300}-preview.json`)
+      .then(r => (r.ok ? r.json() : null)).catch(() => null));
+    for (const sky of await Promise.all(defaultJobs)) {
+      if (sky) rememberSky(sky);
+    }
+    const extraJobs = presets.flatMap((p, i) => [150, 300, 600, 1200]
+      .filter(f => f !== (p.fov || 300))
+      .map(fov => fetch(`data/sky-${i}-${fov}-preview.json`).then(r => (r.ok ? r.json() : null)).catch(() => null)));
+    for (const sky of await Promise.all(extraJobs)) {
+      if (sky) rememberSky(sky);
+    }
+    return;
+  }
   const fovs = [150, 300, 600, 1200];
   const queries = presets.flatMap((p) => fovs.map((fov) => ({
     ra: p.ra,
@@ -1781,9 +1910,17 @@ async function init() {
   const hasUrlCoords = parseUrlParams();
   bindEvents();
 
-  const stateResp = await fetch("/api/state");
-  const boot = await stateResp.json();
-  if (!stateResp.ok) throw new Error("Could not initialize sky viewer");
+  let boot;
+  try {
+    const stateResp = await fetch("/api/state");
+    if (!stateResp.ok) throw new Error(`HTTP ${stateResp.status}`);
+    boot = await stateResp.json();
+  } catch {
+    const staticResp = await fetch("data/state.json");
+    if (!staticResp.ok) throw new Error("Could not initialize sky viewer");
+    boot = await staticResp.json();
+    state.staticDemo = true;
+  }
   state.config = boot.config;
   if (boot.initial_sky) rememberSky(boot.initial_sky);
   populateReleases(boot.config.releases);
