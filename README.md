@@ -1,5 +1,7 @@
 # Uju Gaja — SPHEREx Sky Explorer
 
+(Uju Gaja = "let's go to space!", in korean)
+
 A web explorer to visualize NASA SPHEREx sky timeline cutouts, built for the 2026 NASA Space Apps Challenge. Enter any sky coordinate (decimal degrees or sexagesimal) or pick a curated target to blink exposures; compare changes within the same detector band; inspect spectra and Fourier bands, and overlay Gaia DR3, AllWISE, and SPHEREx quality flags.
 
 ## Set-up
@@ -28,7 +30,7 @@ Open `http://127.0.0.1:8080`. The five challenge presets are available on startu
 - **Fast previews & resilient fallbacks**: Standard views first load a fast preview (earliest and latest exposure per detector) while **RGB** (`D1`/`D3`/`D5`) enriches up to 12 epochs in the background with live progress telemetry. Changing FOV (`150"`, `300"`, `600"`, `1200"`, or custom `60–1800"`) builds an instant preview from cached pixels while any larger request finishes.
 - **Coordinate snapping & outage handling**: Rounded 5-decimal **Share URL** coordinates and 4-decimal **Go** input coordinates snap automatically to matching cached targets on both client and server. If IRSA SIA is temporarily unreachable, `Archive.search` falls back to previously cached observation footprints covering the requested center so IBE cutouts can still load, and **Random** falls back to available cached targets instead of leaving an error banner.
 
-## Scientific display conventions and features
+## Features
 
 - **Units & WCS**: Pixel values are measured surface brightness in **MJy/sr** from SPHEREx `IMAGE` HDUs. Wavelengths and bandwidths are read from the FITS spectral WCS in **µm** across the six detector arrays (`D1`–`D6`, `0.75–5.0 µm`) at original detector pixels without reapplying celestial SIP distortion.
 - **Viewing modes (`Blink`, `Mean (+)`, `Diff (-)`)**:
