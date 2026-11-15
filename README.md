@@ -1,8 +1,10 @@
-# SPHEREx sky explorer
+# Uju Gaja — SPHEREx Sky Explorer
+
+A web explorer to visualize NASA SPHEREx sky timeline cutouts, built for the 2026 NASA Space Apps Challenge. Enter any sky coordinate (decimal degrees or sexagesimal) or pick a curated target to blink exposures; compare changes within the same detector band; inspect spectra and Fourier bands, and overlay Gaia DR3, AllWISE, and SPHEREx quality flags.
 
 ## Set-up
 
-Run from this directory with Python 3.11 or newer:
+Run from the `SPHEREx/` directory with Python 3.11 or newer:
 
 ```powershell
 python -m pip install -r requirements.txt
@@ -10,32 +12,41 @@ python server.py --precache
 python server.py
 ```
 
-Open http://127.0.0.1:8080. The server starts warming the five presets automatically.
-The preset menu contains Barnard's Star, Epsilon Indi B, WISE 0855, RW Aurigae, and R Draconis. Positions were resolved through CDS Sesame/SIMBAD on 2026-11-14. WISE 0855 uses a 600-arcsecond field to include its displacement from the catalog position. Other presets use 300 arcseconds. The stored positions, provenance, and preset field sizes are in `releases.json`.
+Open `http://127.0.0.1:8080`. The five challenge presets are available on startup: **Barnard's Star**, **Epsilon Indi B**, **WISE 0855**, **RW Aurigae**, and **R Draconis**. Coordinates (`releases.json`) were resolved via CDS Sesame/SIMBAD on 2026-11-14. You can enter coordinates in decimal degrees or sexagesimal (for example `08h55m10.831s`, `-7d14m42.53s`), and click **Share URL** to copy an embeddable `?ra=...&dec=...&fov=...` link containing the displayed target's information.
 
-## Live data and cache behavior
+## System overview
 
-The backend discovers current SPHEREx spectral-image collections from `https://irsa.ipac.caltech.edu/SIA?MAXREC=0`. It includes the advertised wide and deep collections. The default `auto` selection searches all currently advertised spectral-image releases. The release selector can restrict that search. The refresh button manually updates release discovery.
+1. **Browser boot**: Opening the page calls `GET /api/state` to load release metadata, presets, and the initial sky view, and triggers `POST /api/batch` to load the remaining preset targets in the background.
+2. **Live archive & catalog query**: Requesting a sky position calls `GET /api/sky`. The backend queries IRSA's SIA v2 endpoint to find matching SPHEREx exposures inside the requested release and time window (`0.5–15` years), while running concurrent cone searches on IRSA Gator for **Gaia DR3** and **AllWISE** catalog sources.
+3. **Cutout retrieval & reprojection**: For selected exposures covering the field center, the server downloads compact FITS cutouts from IRSA IBE, masks fatal bitmask flags, reads local wavelengths and bandwidths from the FITS spectral WCS, and reprojects each frame onto a shared north-up, east-left `64×64` pixel grid encoded as Base64 typed arrays.
+4. **Client-side interactive rendering**: `app.js` decodes the sky cube once in memory so switching modes (**Blink**, **Mean (+)**, **Diff (-)**), detectors (`D1`–`D6`, **Available arrays**, **Spatial smoothing**, **RGB**), **Spectral FFT** filters, FOV sizes, catalog overlays, and timeline brushes updates locally.
 
-SIA queries constrain position and observation time. The FOV is the full width of the square display in **arcseconds**. SIA discovers exposures containing its center. Native IBE cutouts use shared 600/1200/2400-arcsecond size buckets (with diagonal padding). The timeline brush selects among actual returned observing dates; the epoch dots are hidden without disabling the brush. `?ra=...&dec=...&fov=...&window=...` URLs work, and Share URL includes display settings.
+## Live data and caching
 
-For a responsive preview, the backend selects the earliest and latest available exposure per detector band, preferring observations containing the field center, after deduplicating reprocessed exposures. Exposures that only intersect the outer field are not included. The response records selection, collection names, observation dates, original access URLs, and any missing downloads. Small IBE cutouts are reprojected with their celestial WCS, including SIP distortion, onto a common north-up, east-left 64×64 grid.
-
-SIA discovery and rendered previews expire after one hour. Expired previews remain visible while the backend refreshes them; new fields show a loading state. 
-
-Uncached requests show retrieval stages, elapsed time and actual completed/total image requests. Discovery and queue stages use an indeterminate progress bar. When SIA returns no images, the response immediately says “No data found” without waiting for catalog downloads.
+- **Live release discovery**: The backend fetches available wide and deep SPHEREx collections from `https://irsa.ipac.caltech.edu/SIA?MAXREC=0`. The default `auto` option searches all advertised releases; the dropdown narrows to a single release and `↻` forces a live refresh.
+- **Two-tier cache**: Sky cubes sit in a `128`-entry in-memory LRU cache backed by a persistent SQLite database (`.cache/archive.sqlite3`) along with raw FITS cutouts, SIA searches, and catalog queries (default 7-day TTL, configurable via `SPHEREX_CACHE_TTL`). Expired entries stay visible immediately while refreshing in the background.
+- **Fast previews & resilient fallbacks**: Standard views first load a fast preview (earliest and latest exposure per detector) while **RGB** (`D1`/`D3`/`D5`) enriches up to 12 epochs in the background with live progress telemetry. Changing FOV (`150"`, `300"`, `600"`, `1200"`, or custom `60–1800"`) builds an instant preview from cached pixels while any larger request finishes.
+- **Coordinate snapping & outage handling**: Rounded 5-decimal **Share URL** coordinates and 4-decimal **Go** input coordinates snap automatically to matching cached targets on both client and server. If IRSA SIA is temporarily unreachable, `Archive.search` falls back to previously cached observation footprints covering the requested center so IBE cutouts can still load, and **Random** falls back to available cached targets instead of leaving an error banner.
 
 ## Scientific display conventions and features
 
-- SPHEREx `IMAGE` values are **MJy/sr**, not micrometers. Wavelengths and bandwidths come from the FITS spectral WCS and are in **µm**. The wavelength lookup uses detector pixels without reapplying the celestial SIP distortion.
-- The spectrum panel shows actual center-pixel observations with their dates and wavelengths. Clicking the image samples that displayed pixel across the downloaded observations. If that pixel has no valid observations, the panel explicitly switches to a **field mean** of valid pixels, with the corresponding mean wavelengths. This fallback is not center-pixel photometry and is not used for FFT filtering. If the entire field is unavailable, explanatory messages replace empty image and chart panels. These previews are not proper-motion tracking, source photometry, a simultaneous SED, or an inferred 102-band spectrum.
-- A spectral FFT needs uniformly spaced wavelength samples. For spacing `Δλ` in µm and `N` samples, frequency is `k/(N Δλ)` cycles/µm; its reciprocal is a **spectral period** in µm. 
-- `compute_spectral_fft` rejects irregular, duplicate, or missing wavelengths. The browser checks the same sampling requirement and requires at least four samples. Amplitude is `abs(FFT)`, not power.
-- Available-array and Mean views average finite samples, with no zeros substituted for missing detectors. RGB combines D5/D3/D1 into red/green/blue in Mean mode. A missing required detector triggers a labeled grayscale view of available data; individual pixels with incomplete RGB coverage also use labeled grayscale. Fully missing pixels remain transparent. Invert complements the display stretch and leaves measured values and masks unchanged. Spatial smoothing is a display-only local mean.
-- Diff requires a single detector and at least two observations. It compares positive/negative means only where all selected center wavelengths differ by at most one quarter of the smaller local bandwidth. Other pixels remain blank. This is a conservative visualization check, not exact bandpass or PSF matching for scientific variability measurements.
-- Gaia circles are projected into the image WCS after an approximate proper-motion propagation to the frame's date, or to the midpoint of the contributing time span for a composite. Lines connect the reference and estimated positions. Sources without proper motion remain at their reference positions. This PM-only estimate omits parallax, radial velocity, perspective acceleration and positional uncertainty; it is a visual aid, not a confirmed source association. AllWISE diamonds retain their reference positions. Overlay labels explain these differences, and clicking a visible marker identifies its catalog entry.
-- Quality-flag outlines and hover readouts use the same contributing frames: the current frame for single-channel Blink, the three chosen exposures for RGB Blink, or the selected contributors for Mean. RGB Gaia markers use the midpoint of the contributing observation dates and are labeled accordingly. Image and overlay share the same zoom transform. Fourier controls filter the brightness spectrum, not the spatial image or catalog positions.
-- Aladin 3.8.2 loads on demand from a local, pinned distribution. Survey tiles still require an external archive. AllWISE uses IRSA's published HiPS mirror of `P/allWISE/color`; the CDS endpoints returned errors during verification. The core viewer uses local D3 and cached archive data, so external font or Aladin loading cannot block it.
-- Aladin retains the user's survey zoom across coordinate/FOV updates. Survey zoom is separate from the SPHEREx science FOV and does not trigger an image query.
+- **Units & WCS**: Pixel values are measured surface brightness in **MJy/sr** from SPHEREx `IMAGE` HDUs. Wavelengths and bandwidths are read from the FITS spectral WCS in **µm** across the six detector arrays (`D1`–`D6`, `0.75–5.0 µm`) at original detector pixels without reapplying celestial SIP distortion.
+- **Viewing modes (`Blink`, `Mean (+)`, `Diff (-)`)**:
+  - **Blink**: Steps through selected epochs in time order. **RGB** maps `D5` → Red, `D3` → Green, `D1` → Blue using the nearest-in-time exposure in each channel (skipping duplicate combinations and falling back to labeled grayscale if a channel is missing in the active brush). Channel dates can differ; RGB is a false-color visualization, not simultaneous photometry or motion tracking.
+  - **Mean (+)**: Averages finite pixels without null-filler detectors. **Spatial smoothing** applies a display-only `3×3` local mean; **Invert** flips the display stretch without modifying underlying data or masks.
+  - **Diff (-) (Same-Band Subtraction)**: Subtracts earlier/`-` epochs from later/`+` epochs within the **same SPHEREx detector color band** (`D1`–`D6`). Single-band (`D1`–`D6`) and **RGB** views subtract within each band; **Available arrays** and **Spatial smoothing** compute per-band differences for every detector with `≥ 2` active epochs and average the valid difference maps together. You can click timeline epoch chips to cycle `+`, `-`, or `.` (skip), and drag the **Time Window Brush** to isolate specific date spans.
+- **Brightness spectrum & spectral FFT**: Plots center-pixel (with PSF-aperture fallback), clicked-pixel, or explicitly labeled **field-mean** brightness (`MJy/sr`) vs. wavelength (`µm`). When observations have irregular LVF wavelengths (minimum 4 finite samples, drawing across active exposures when needed), they are linearly resampled onto a uniform 32-point grid so `|FFT|` bar amplitudes vs. spectral period (`µm`) and additive **Low / Mid / High** reconstructions work cleanly on real cutouts.
+- **Overlays & quality flags**: **Gaia DR3** circles apply an approximate proper-motion shift (`pmra`, `pmdec`) to the displayed epoch (or contributor midpoint for composites) with trails from their reference epoch, omitting parallax, radial velocity, and uncertainties. **WISE** (`AllWISE`) diamonds mark static catalog positions. Clicking any marker shows its catalog ID and magnitude. **Flags** highlights active SPHEREx bitmask artifacts (`TRANSIENT`, `OVERFLOW`, `NONFUNC`, `GHOST`, `STREAK`, etc.) strictly from the exposures contributing to the current view (propagating neighbor flags under **Spatial smoothing**).
+- **Aladin Lite survey panel**: Loads a local copy of Aladin Lite v3.8.2 on demand with **AllWISE Color** (served via IRSA's `P/allWISE/color` HiPS mirror), **2MASS Color**, and **DSS2 Optical**. Survey pan tracks the target coordinates while survey zoom stays independent of the SPHEREx science FOV.
 
-# Used resources
+## Used resources, datasets & licenses
+
+| Resource | Role in Uju Gaja | Source / Endpoint | License / Terms |
+| --- | --- | --- | --- |
+| **NASA SPHEREx Mission Data** | Spectral-image discovery, FITS `IMAGE` cutouts, `FLAGS`, spectral `WCS-WAVE` | [IRSA SIA v2](https://irsa.ipac.caltech.edu/SIA) & [NASA/IPAC IRSA](https://irsa.ipac.caltech.edu/) (`/ibe/data/spherex/...`) | Public Domain / [NASA Open Data Policy](https://science.nasa.gov/open-science/open-data/) |
+| **Gaia DR3 (`gaia_dr3_source`)** | Proper-motion star overlay & catalog identification | [IRSA Gator Cone Search](https://irsa.ipac.caltech.edu/cgi-bin/Gator/nph-query) / [ESA Gaia DR3](https://www.cosmos.esa.int/web/gaia/dr3) | [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) (ESA / DPAC) |
+| **AllWISE (`allwise_p3as_psd`) & 2MASS** | Mid-/near-IR catalog overlay & Aladin HiPS survey imagery | [IRSA Gator](https://irsa.ipac.caltech.edu/cgi-bin/Gator/nph-query) & [IRSA AllWISE HiPS](https://irsa.ipac.caltech.edu/data/hips/CDS/AllWISE/RGB-W4-W2-W1) | Public Domain / [NASA/IPAC IRSA](https://irsa.ipac.caltech.edu/) |
+| **CDS Sesame / SIMBAD** | Pre-cached preset target coordinate resolution (2026-11-14) | [CDS Sesame](https://cds.unistra.fr/cgi-bin/nph-sesame) / [SIMBAD](https://simbad.cds.unistra.fr/simbad/) | Open academic astronomy service (CDS) |
+| **D3.js v7** | Interactive brightness spectrum, FFT bar chart, and time-window brush | [`vendor/d3.v7.min.js`](vendor/d3.v7.min.js) / [d3js.org](https://d3js.org/) | [ISC License](vendor/LICENSE.d3) |
+| **Aladin Lite v3.8.2** | On-demand HiPS reference sky viewer | [`vendor/aladin-3.8.2.js`](vendor/aladin-3.8.2.js) / [CDS Aladin Lite](https://aladin.cds.unistra.fr/) | [GNU GPL v3](vendor/LICENSE.aladin) |
+| **Astropy, NumPy, SciPy, Requests** | FITS/VOTable parsing, SIP WCS reprojection, FFT, HTTP retries (`requirements.txt`) | [PyPI](https://pypi.org/) (`astropy`, `numpy`, `scipy`, `requests`) | BSD-3-Clause (Astropy, NumPy, SciPy); Apache-2.0 (Requests) |
