@@ -1,6 +1,6 @@
 # Uju Gaja — SPHEREx Sky Explorer
 
-(Uju Gaja = "let's go to space!", in korean)
+(Uju Gaja = "let's go to space!", in korean).
 
 A web explorer to visualize NASA SPHEREx sky timeline cutouts, built for the 2026 NASA Space Apps Challenge. Try the live static preset demo on [GitHub Pages](https://oscar27nx.github.io/SPHEREx/) or run locally to query any coordinate in the sky (decimal degrees or sexagesimal) to blink exposures, compare changes within the same detector band, inspect spectra and Fourier bands, and overlay Gaia DR3, AllWISE, and SPHEREx quality flags.
 
