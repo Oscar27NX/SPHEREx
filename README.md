@@ -4,7 +4,7 @@
 
 A web explorer to visualize NASA SPHEREx sky timeline cutouts, built for the 2026 NASA Space Apps Challenge. Enter any sky coordinate (decimal degrees or sexagesimal) or pick a curated target to blink exposures; compare changes within the same detector band; inspect spectra and Fourier bands, and overlay Gaia DR3, AllWISE, and SPHEREx quality flags.
 
-## Set-up
+## Set-up and Demo
 
 Run from the `SPHEREx/` directory with Python 3.11 or newer:
 
@@ -15,6 +15,8 @@ python server.py
 ```
 
 Open `http://127.0.0.1:8080`. The five challenge presets are available on startup: **Barnard's Star**, **Epsilon Indi B**, **WISE 0855**, **RW Aurigae**, and **R Draconis**. Coordinates (`releases.json`) were resolved via CDS Sesame/SIMBAD on 2026-11-14. You can enter coordinates in decimal degrees or sexagesimal (for example `08h55m10.831s`, `-7d14m42.53s`), and click **Share URL** to copy an embeddable `?ra=...&dec=...&fov=...` link containing the displayed target's information.
+
+Alternatively, a demo containing only the data pertaining to the five challenge presets is readily available in the link: https://oscar27nx.github.io/SPHEREx/
 
 ## System overview
 
