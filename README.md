@@ -4,14 +4,11 @@
 
 A web explorer to visualize NASA SPHEREx sky timeline cutouts, built for the 2026 NASA Space Apps Challenge. Try the live static preset demo on [GitHub Pages](https://oscar27nx.github.io/SPHEREx/) or run locally to query any coordinate in the sky (decimal degrees or sexagesimal) to blink exposures, compare changes within the same detector band, inspect spectra and Fourier bands, and overlay Gaia DR3, AllWISE, and SPHEREx quality flags.
 
-## Set-up
+### Live GitHub Pages demo (one click away)
 
-### Live GitHub Pages demo (no server required)
+Open `https://oscar27nx.github.io/SPHEREx/`. All five NASA challenge presets (**Barnard's Star**, **Epsilon Indi B**, **WISE 0855**, **RW Aurigae**, and **R Draconis**) and all interactive controls (**Blink**, **Mean (+)**, **Diff (-)**, `D1`–`D6`, **RGB**, **Spatial smoothing**, **Spectral FFT**, **Gaia DR3**, **WISE**, **Flags**, **Aladin**, **Time Window Brush**, **Random**, and **Share URL**) work directly in the browser. Arbitrary new sky coordinates require running the local Python backend; we explain how to do so next.
 
-Open `https://oscar27nx.github.io/SPHEREx/`. When hosted statically without Python, `app.js` detects that `/api/state` is unavailable (`404`) and loads pre-cached JSON snapshots from `data/` (`state.json` and 35 `sky-{preset}-{fov}-{preview|rgb}.json` files). All five NASA challenge presets (**Barnard's Star**, **Epsilon Indi B**, **WISE 0855**, **RW Aurigae**, and **R Draconis**) and all interactive controls (**Blink**, **Mean (+)**, **Diff (-)**, `D1`–`D6`, **RGB**, **Spatial smoothing**, **Spectral FFT**, **Gaia DR3**, **WISE**, **Flags**, **Aladin**, **Time Window Brush**, **Random**, and **Share URL**) work directly in the browser. Arbitrary new sky coordinates require running the local Python backend.
-
-### Local server (full live IRSA archive queries)
-## Set-up and Demo
+##Local server set-up (full live IRSA archive queries)
 
 Run from the `SPHEREx/` directory with Python 3.11 or newer:
 
